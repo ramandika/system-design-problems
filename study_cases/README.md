@@ -2,6 +2,7 @@
 
 Index of cases and the patterns each one covers. Start with any case's `README.md`.
 Cross-case concept frequencies and the shared contracts: [CONCEPTS.md](CONCEPTS.md).
+Mermaid diagram standard (shapes, icons, arrows, API edges): [DIAGRAMS.md](DIAGRAMS.md).
 
 ## Cases
 
@@ -124,3 +125,41 @@ Cross-case concept frequencies and the shared contracts: [CONCEPTS.md](CONCEPTS.
 | Exactly-once money effects via idempotency + serialization | Payment System (idempotency keys + bank-side references), Uber Eats / E-Commerce (idempotent checkout), Deployment System (outbox + fencing), Apple App Store (purchase ledger) |
 | Prefix index & multi-tier suggestion serving | Typeahead (materialized top-k, client→edge→per-prefix cache), Google Maps (geocoding/POI autosuggest), Google Docs (doc search metadata) |
 | Collaborative sync: server-sequenced ops vs CRDTs | Google Docs (OT, star topology, transform-based undo), Frontend Calendar (server-sequenced ops, field-level LWW), Mobile Chat (queue + backfill) |
+
+## Companion doc usage
+
+Reference companions (`<NAME>.md`) ordered by how often they are cited from
+other files in this repo, excluding this table's own rows. Count = mentions of
+`NAME.md` outside the doc itself. All counts excluded the README table when
+computed; re-counts should do the same or every row inflates by exactly 1.
+
+| Refs | Citing files | Companion |
+|-----:|----:|-----------|
+| 51 | 14 | [Kafka](KAFKA.md) |
+| 35 | 7 | [Realtime Transport](REALTIME-TRANSPORT.md) |
+| 21 | 4 | [ZooKeeper](ZOOKEEPER.md) |
+| 17 | 7 | [Bigtable](BIGTABLE.md) |
+| 15 | 6 | [Redis](REDIS.md) |
+| 15 | 5 | [Deployment Safety](DEPLOYMENT-SAFETY.md) |
+| 12 | 3 | [Vector Search](VECTOR-SEARCH.md) |
+| 12 | 3 | [CDN](CDN.md) |
+| 11 | 3 | [Search Index](SEARCH-INDEX.md) |
+| 10 | 3 | [Object Storage](OBJECT-STORAGE.md) |
+| 10 | 2 | [Sync & CRDT](SYNC-AND-CRDT.md) |
+| 10 | 1 | [ML Platform](ML-PLATFORM.md) |
+| 7 | 3 | [Consensus & Quorum](CONSENSUS-AND-QUORUM.md) |
+| 6 | 3 | [Postgres](POSTGRES.md) |
+| 4 | 2 | [Probabilistic Structures](PROBABILISTIC-STRUCTURES.md) |
+| 4 | 2 | [Cassandra](CASSANDRA.md) |
+| 4 | 1 | [GPU Inference Serving](GPU-INFERENCE-SERVING.md) |
+| 2 | 1 | [RPC & Serialization](RPC-SERIALIZATION.md) |
+| 2 | 1 | [Media Pipelines](MEDIA-PIPELINES.md) |
+| 0 | 0 | [Batch & Stream Processors](BATCH-STREAM-PROCESSORS.md) |
+| 0 | 0 | [Distributed Transactions](DISTRIBUTED-TRANSACTIONS.md) |
+| 0 | 0 | [Flow Control](FLOW-CONTROL.md) |
+| 0 | 0 | [Geo-Spatial](GEO-SPATIAL.md) |
+| 0 | 0 | [Graph Store](GRAPH-STORE.md) |
+| 0 | 0 | [Ledgers & Payments](LEDGERS-AND-PAYMENTS.md) |
+| 0 | 0 | [Load Balancing](LOAD-BALANCING.md) |
+| 0 | 0 | [Push Notifications](PUSH-NOTIFICATIONS.md) |
+| 0 | 0 | [TSDB & Metrics](TSDB-AND-METRICS.md) |
