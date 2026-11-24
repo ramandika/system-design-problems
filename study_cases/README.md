@@ -1,6 +1,7 @@
 # Study Cases
 
 Index of cases and the patterns each one covers. Start with any case's `README.md`.
+Cross-case concept frequencies and the shared contracts: [CONCEPTS.md](CONCEPTS.md).
 
 ## Cases
 
