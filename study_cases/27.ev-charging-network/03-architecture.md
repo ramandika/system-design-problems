@@ -2,61 +2,41 @@
 
 ## High-level picture
 
+Q: How does a charging session flow from the charger through the OCPP gateway and event bus to billing, and how do partners exchange tokens, CDRs, and occupancy over OCPI?
+
+```mermaid
+flowchart LR
+    ch((chargers<br/>15K DC · 85K AC<br/>mid-meter on board)) <-->|"1· TransactionEvent(Started)<br/>OCPP 2.0.1 WS · JSON"| gw["OCPP gateway fleet<br/>stateless acceptors<br/>~25K sockets/node"]
+    gw -.->|"3· produce: tx.events · meter-values"| bus{{"📨 event bus<br/>partitioned by charger/site"}}
+    gw -.->|"produce: status · commands-ack"| bus
+    gw -->|"2· gRPC Authorize(idToken)"| tok["token auth<br/>hot-path cache · p95 < 2 s"]
+    tok -->|"⚡ GET token:{id}"| rd[("⚡ Redis<br/>token cache · device shadow")]
+    tok -->|"POST /oicg/authorize<br/>OCPI 2.2.1 · JSON"| em[/"OCPI counterparties<br/>eMSP · CPO roles · 2.2.1"/]
+    bus -.->|"consume: tx.events"| ses["session state<br/>source of truth for open sessions"]
+    bus -.->|"consume: meter-values"| tar["tariff/CDR engine<br/>snapshot tariff → emit CDR<br/>idempotent per session ID"]
+    bus -.->|"consume: status"| av["availability svc<br/>status → station occupancy"]
+    bus -->|"append raw_events/{charger}/{session}"| raw[("raw event store<br/>dispute re-run input · 18 mo retention")]
+    bus -.->|"consume: commands-ack"| dv["device mgmt<br/>shadow · cmd ACK · OTA"]
+    dv -.->|"produce: remote cmds"| bus
+    bus -.->|"consume: remote cmds"| gw
+    tar ==>|"4· append CDR entry"| led[("billing ledger<br/>double-entry · append-only")]
+    inv["invoice pipeline<br/>captures · refunds · invoices"] -->|"read session CDRs"| led
+    inv -->|"POST /payments/capture<br/>HTTPS · JSON"| psp[/"payment PSP"/]
+    inv -.->|"append capture · invoice entries"| led
+    led -.->|"cdr · settlement copy"| oca["OCPI adapter<br/>external perimeter"]
+    em -->|"PUT /oicg/tokens<br/>OCPI 2.2.1 · JSON"| oca
+    oca -.->|"token list"| tok
+    av -.->|"station status payloads"| oca
+    em -->|"POST /ocpi/cdrs<br/>OCPI 2.2.1 · JSON"| oca
+    oca -.->|"append inbound CDR entry"| led
+    oca -->|"POST /oicg/cdrs · /locations/status<br/>OCPI 2.2.1 · JSON"| em
 ```
-                       DRIVERS & PARTNERS                       FLEET (the hard clients)
-              ┌────────────┬──────────────┐          ┌────────────────────────────────┐
-              │ Driver app │ eMSP partners│          │  15K DC / 85K AC chargers      │
-              └─────┬──────┴──────┬───────┘          │  embedded Linux, 4G, MID meter │
-                    │ HTTPS       │ OCPI 2.2.1       └───────┬────────────────────────┘
-                    ▼             ▼                          │  OCPP 2.0.1 WebSocket
-   ┌─────────────────── HTTPS/edge/API tier ─────────────┐  │  (keepalive ≤60s, jittered
-   │  web/app APIs   app-auth API       OCPI adapter     │  │   reconnect)
-   └──────┬──────────────┬───────────────┬──────────────┘
-          │              │               │  remote cmds  │
-          │       ┌──────▼───────┐  ┌────▼──────────────────▼──────┐
-          │       │ Token auth   │  │ OCPP GATEWAY fleet           │
-          │       │ (token cache │─►│ stateless acceptors, ~25K    │
-          │       │  + partner   │  │ sockets/node; device shadow  │
-          │       │  lookups)    │  │ in Redis/DB → any node       │
-          │       └──────┬───────┘  │ serves any charger           │
-          │              │          └────┬─────────────────────────┘
-          ▼              ▼               ▼
 
-   (the ▼s drop lifecycle *events* on the bus; the ─► into the gateway is the
-    sync auth reply that returns on the originating charger's WebSocket)
-
-   ┌─────────────────────────────────────────────────────────────────┐
-   │ EVENT BUS (Kafka-style, partitioned by charger / site key)      │
-   │ topics: tx-events · meter-values · status · auth · commands-ack │
-   └──────┬──────────────┬───────────────┬──────────────┬────────────┘
-          ▼              ▼               ▼              ▼
-   ┌────────────┐ ┌───────────┐ ┌──────────────┐ ┌──────────────────┐
-   │ SESSION    │ │ TARIFF &  │ │ AVAILABILITY │ │ DEVICE MGMT      │
-   │ STATE      │ │ CDR       │ │ service      │ │ (shadow, config, │
-   │ (charging  │ │ ENGINE    │ │ (occupancy   │ │  firmware OTA)   │
-   │ and billing│ │ (versioned│ │  normalize + │ │                  │
-   │ lifecycle) │ │  tariffs, │ │  fanout)     │ │                  │
-   └────────────┘ │ idempotent│ └──────┬───────┘ └──────────────────┘
-                  │  ledger)   │        │
-                  └─────┬─────┘        ▼
-                        ▼         per-partner OCPI push queues (partner GETs resync)
-                  ┌───────────┐   ──► OCPI adapter ──► eMSP partner APIs.
-                  │ BILLING   │   Our driver app and POI feeds consume the
-                  │ LEDGER    │──► normalizer output directly, not these
-                  │ (double-  │    partner queues. Invoices, PSP payouts,
-                  │  entry)   │    partner settlement. Inbound roam CDRs (other
-                  └───────────┘   CPOs' sessions for our drivers) arrive via the
-                                  OCPI adapter's inbound endpoint: validated,
-                                  priced, and entered in the "we owe partner X"
-                                  direction of the same ledger.
-
-   raw event store (18 months) — archived from the bus; the
-   tariff engine re-runs disputed sessions deterministically
-
-   SITE LEVEL (per site, autonomous): site controller (PLC/edge box)
-   enforces grid connection limit; cloud is advisory (schedules,
-   prices, optimization) — never in the power-control critical path
-```
+Site level (per site, autonomous): a site controller — a PLC/edge box — enforces the grid
+connection limit. The cloud is advisory (schedules, prices, optimization) and is never in
+the power-control critical path. The diagram above intentionally omits the site controller
+and the cloud load advisor: it answers the session/billing/OCPI question only, and the
+power-control path never crosses the WAN (deep dive 4).
 
 ## Components
 

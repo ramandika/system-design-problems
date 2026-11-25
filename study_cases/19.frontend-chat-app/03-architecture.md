@@ -4,33 +4,19 @@ The client's shape is dictated by one rule: **the server log is the source of tr
 local store is the projection, the view is a function of the store.** Everything else is
 in service of that.
 
-```
-+---------------------------------------------------------------------+
-| VIEW LAYER                                                          |
-|   virtualized message list | composer | conversation list | badges  |
-|   renders from immutable store snapshots; emits intents only        |
-+-------------^---------------------------------|---------------------+
-              | hydrate (reactive)               | intents (send/open/read)
-+-------------+---------------------------------v---------------------+
-| UI STATE (in-memory store)          - single source for the view     |
-|   per-conversation: message window, ordered by server seq           |
-|   optimistic index: client_msg_id -> pending message                |
-|   typing/presence (ephemeral), drafts, scroll anchors               |
-+------+-------------------------------------------^------------------+
-       | write-through                (single-writer boundary)
-+------v-------------------------------------------+------------------+
-| SYNC ENGINE - the only component that talks to the wire             |
-|   outbox drain (durable queue from local store)                     |
-|   live event intake: seq-ordered apply, dedup by client_msg_id      |
-|   backfill on reconnect: per-conv last_seq -> fetch gap -> merge    |
-|   receipts/read markers, presence send loop                         |
-+------------------------------------------------+--------------------+
-             WebSocket (live)  +  HTTPS (bulk backfill, media CDN)
-+------------------------------------------------v--------------------+
-| LOCAL STORE (IndexedDB on web; SQLite native/wasm)                  |
-|   messages(conv_id, seq)   outbox(client_msg_id) -- durable, first  |
-|   conversations, read markers, height cache, media cache (LRU 1GB)  |
-+---------------------------------------------------------------------+
+Q: How does a send move through the client's four layers without losing a tap — and how do live events, backfill, and media reach the same store through one writer?
+
+```mermaid
+flowchart LR
+    u((🧑 user)) ==>|"tap send(text)"| v[view-layer<br/>virtualized list · composer<br/>renders snapshots · emits intents]
+    v -->|"intent: send · read"| se[sync-engine · the only writer<br/>outbox drain · seq-ordered intake<br/>reconnect backfill]
+    se -->|"1· PUT outbox:{client_msg_id}<br/>PUT messages batch (recv · backfill)<br/>PUT media cache:{hash}"| db[(local store · IndexedDB / SQLite<br/>messages by conv,seq · outbox<br/>read markers · media cache LRU)]
+    st -->|"read messages conv,seq<br/>hydrate viewport window"| db
+    se -->|"2· message · seq<br/>optimistic entry · live push to window"| st[ui-state<br/>message window · optimistic index<br/>typing · presence]
+    st -->|"hydrated snapshot"| v
+    se <-->|"WS /sync<br/>wss · JSON · ack client_msg_id,seq"| srv[/chat-backend<br/>Case 03 wire protocol/]
+    se -->|"3· POST /batch_sync (drain · reconnect backfill)<br/>HTTPS · JSON · last_seq per conv"| srv
+    se -->|"GET /media/{content_hash}<br/>HTTPS · bytes · priority=viewport"| cdn[/🌍 CDN<br/>vendor/]
 ```
 
 ## Components

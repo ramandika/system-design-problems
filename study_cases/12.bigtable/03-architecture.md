@@ -2,45 +2,26 @@
 
 ## Diagram
 
-```
-                    ┌──────────────────────────────────────────────┐
-                    │                 CONTROL PLANE                │
-                    │  Chubby (5 replicas, Paxos quorum of 3)      │
-                    │   - holds master lock + root tablet pointer  │
-                    │   - holds per-tablet-server liveness locks   │
-                    └────────┬──────────────────────┬──────────────┘
-                             │ lease/lock (not on data path)       │
-                             ▼                                     ▼
-                    ┌──────────────┐                      ┌──────────────┐
-                    │    MASTER    │  assigns/moves/      │ Tablet server│
-                    │  (elected)   │  splits tablets,     │  (stateful,  │
-                    └──────┬───────┘  balances load       │  ~50 tablets)│
-                           │ Gossip: tablet list          └──────┬───────┘
-                           ▼                                     │
-   Clients ── discovery:                                             │
-   root → METADATA tablet → target server (cached in client;         │
-   stale entries trigger repush — client never talks to master)      │
-                             │                                       │
-   ┌─────────────────────────┴─────────────┐                         │
-   │        DATA PLANE (per tablet server) │                         │
-   │                                       │                         │
-   │  Tablet A        Tablet B     ...     │                         │
-   │  ┌──────────────────────────┐         │                         │
-   │  │ MemTable (in RAM)        │◄── writes: WAL→MemTable→ack     │
-   │  │ Block cache (reads hot)  │         │                         │
-   │  │ SSTables (immutable):    │         │                         │
-   │  │  newer ... older         │◄── reads: MemTable + SSTables    │
-   │  │ Bloom filter per SSTable │         │      (newest version wins) │
-   │  │ Locality groups →        │         │                          │
-   │  │  separate SSTable files  │         │                          │
-   │  └──────────────────────────┘         │                          │
-   └─────────────────────────┬─────────────┘                          │
-                             │ SSTable files + commit logs            │
-                             ▼                                        │
-                 ┌────────────────────────────────┐                   │
-                 │  Distributed file store (GFS-like): 3-replica   │──►─
-                 │  chunks; SSTables immutable; log = per-server   │
-                 └────────────────────────────────┘
+Q: How does the client data path reach a tablet server, and why do Chubby and the master stay off it?
+
+```mermaid
+flowchart LR
+    subgraph cp [Control plane]
+        ch[(🗝️ Chubby<br/>Paxos quorum 3 of 5<br/>master lock · METADATA pointer)]
+        m[Master<br/>tablet assign · split/merge<br/>load balance · schema]
+    end
+    ts[Tablet server<br/>WAL → MemTable → SSTables<br/>block cache · ~50 tablets]
+    fs[(🪣 distributed file store<br/>GFS-style · 3-replica chunks<br/>SSTables immutable)]
+    c((🧑 clients<br/>embedded library<br/>cached tablet map · stale → repush → retry))
+    c -->|"1· read root-tablet pointer"| ch
+    c -.->|"read METADATA rows<br/>root → owning tablet"| ts
+    c ==>|"2· RPC Read/Write row-key<br/>tablet RPC · proto"| ts
+    ts -->|"append commit-log entry"| fs
+    ts -.->|"flush SSTable files"| fs
+    m -->|"acquire master lock"| ch
+    ts -->|"renew liveness lock"| ch
+    ts -.->|"gossip TabletLoad · SplitDone<br/>RPC · proto"| m
+    m -.->|"RPC LoadTablet / MoveOrder<br/>gossip push"| ts
 ```
 
 ## Components

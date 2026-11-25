@@ -2,47 +2,36 @@
 
 ## Diagram
 
-```
-              ┌─────────────────────────── CLIENT / EDGE ───────────────────────────┐
-              │  authN (OAuth/session), rate limits, TLS                            │
-              └───┬───────────────┬──────────────────┬─────────────────┬────────────┘
-                  │               │                  │                 │
-        profile page      connect request     feed open         member search
-                  │               │                  │                 │
-                  ▼               ▼                  ▼                 ▼
-        ┌────────────────┐ ┌────────────────┐ ┌──────────────┐ ┌─────────────────┐
-        │ PROFILE SERVICE │ │ CONNECTION SVC │ │ FEED SERVICE │ │ SEARCH SVC      │
-        │  (read path     │ │ (state machine)│ │ retrieval→   │ │ member index    │
-        │   ACL-aware)    │ │  invites, edges│ │ light→heavy  │ │ + degree badges │
-        └───┬────────────┘ └───┬────────┬───┘ └───┬──────────┘ └────────┬────────┘
-            │                  │        │         │                     │
-            ▼                  │        ▼         ▼                     ▼
-   ┌──────────────────┐        │  ┌───────────────────────────┐   ┌──────────────┐
-   │ profile store    │        │  │ GRAPH SERVICE             │   │ dist-2 store │
-   │ (KV/doc, shard   │◄───────┼──┤  edges (adjacency lists)  │◄──┤ aggregates + │
-   │  by member id)   │  batch │  │  pending invites          │   │ sample paths │
-   └───┬──────────────┘   hydrate│  └─────────┬─────────────────┘   └──────┬───────┘
-       │                 │       │            │ write event                 │ rebuilt by
-       ▼                 │       │            ▼                             │
-   ┌──────────────────┐  │       │   ┌───────────────────────────────────────────┐
-   │ profile cache    │  │       │   │ EVENT BUS  (Kafka; see ../13.kafka)        │
-   │ Redis, ~95%+ hit │◄─┘       │   │ topics: edge-changes, profile-edits,       │
-   └──────────────────┘          │   │          profile-views, feed-events        │
-                                 │   └──────┬──────────────┬─────────────┬────────┘
-                                 │          ▼              ▼             ▼
-                                 │   ┌────────────┐  ┌────────────┐ ┌──────────────┐
-                                 │   │ Samza-type │  │ PYMK job   │ │ WVYP store   │
-                                 │   │ stream jobs│  │ (dist-2    │ │ (real-time   │
-                                 │   │ invalidators│  │  recompute)│ │ OLAP + rolls)│
-                                 │   └────────────┘  └────────────┘ └──────────────┘
-                                 │
-        ┌────────────────────────┴───────────────────────────┐
-        ▼                                                    ▼
- ┌────────────────────┐                        ┌────────────────────────────┐
- │ NOTIFICATION SVC   │                        │ OFFLINE GRAPH / ML         │
- │ email + push,      │                        │ feature pipelines, ranker  │
- │ dedup + throttling │                        │ training, PYMK ranking     │
- └────────────────────┘                        └────────────────────────────┘
+Q: How do profile reads, connection writes and the event bus fan out to caches, graph stores, PYMK and notifications?
+
+```mermaid
+flowchart LR
+    u((🧑 member)) -->|"1· GET /in/{mid}<br/>HTTPS · JSON"| pr[profile svc<br/>ACL applied at service]
+    pr -->|"⚡ MGET profile:{mid}"| pc[(⚡ Redis profile cache<br/>raw doc · cache-aside)]
+    pr -->|"GET profile:{mid}<br/>on miss → populate"| pst[(profile origin store<br/>authoritative · 10 TB<br/>sharded by member ID)]
+    pr -->|"PUT profile:{mid}"| pst
+    pr -->|"2· gRPC GetDegree()"| g[graph svc<br/>adjacency · degree<br/>path-through-whom]
+    u -->|"3· POST /connect<br/>HTTPS · JSON"| cn[connection svc<br/>invite state machine]
+    cn -->|"4· INSERT invite state=PENDING"| iv[("🐬 MySQL invites<br/>PENDING->ACCEPTED · unique pair (a,b)")]
+    u -->|"5· POST /accept<br/>HTTPS · JSON"| cn
+    cn -->|"UPD invite state<br/>PENDING->ACCEPTED"| iv
+    cn ==>|"PUT edge (a,b)<br/>2 direction rows<br/>1 txn with invite UPD"| gs[(KV graph store<br/>adjacency lists)]
+    g -->|"GET adj:{mid}"| gs
+    g -->|"GET dist-2:{mid}"| ds[(dist-2 store<br/>aggregates · sample paths)]
+    u -->|"6· GET /feed<br/>HTTPS · JSON"| fd[feed svc<br/>retrieval → light → heavy rank]
+    u -->|"7· GET /search<br/>HTTPS · JSON"| sx[search svc<br/>member directory<br/>+ degree annotation]
+    sx -->|"GET postings {company, school}"| si[(🔍 member index<br/>inverted index)]
+    sx -->|"GET dist-2:{mid}"| ds
+    pr -.->|"produce: profile.views"| eb{{📨 Kafka event bus<br/>edge · profile · feed events}}
+    pr -.->|"produce: profile.edits"| eb
+    fd -.->|"produce: feed.engagement"| eb
+    cn -.->|"produce: edge.changes"| eb
+    eb -.->|"consume: profile.edits · edge.changes · profile.views"| jobs[stream jobs<br/>invalidators · PYMK · WVYP]
+    eb -.->|"consume: profile.views · feed.engagement"| ml[offline ML · pipelines<br/>features · PYMK ranking]
+    jobs -->|"DEL profile:{mid}"| pc
+    jobs -->|"PUT agg:{mid}"| ds
+    eb -.->|"consume: edge.changes · profile.views"| nt[🔔 notification svc<br/>push + email · throttle]
+    nt -.->|"invites · WVYP digest<br/>push · email<br/>async · retried"| u
 ```
 
 ## Components

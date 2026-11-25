@@ -2,54 +2,29 @@
 
 ## High-level diagram
 
-```
-                                ┌──────────────────────────────────────────────┐
-                                │                  CLIENT (mobile/web)          │
-                                │  tile cache (LRU) · search · route render ·   │
-                                │  navigation state · GPS telemetry             │
-                                └───────┬──────────────┬───────────────┬───────┘
-                                        │ tiles        │ search/geocode│ directions
-                                        ▼              │               │
-                    ┌──────────────────────────────┐   │               │
-                    │ EDGE/CDN  (worldwide POPs)   │   │               │
-                    │ tile cache, hot-region POPs  │   │               │
-                    └───────┬──────────────────────┘   ▼               ▼
-                            │ miss (5%)      ┌─────────────┐   ┌────────────────────┐
-                            ▼                │ GEO-FRONTEND│   │ DIRECTIONS SERVICE │
-                    ┌──────────────┐         └──────┬──────┘   │  alternatives,     │
-                    │ TILE SERVICE │                │          │  turn geometry     │
-                    │ raster+vector│                ▼          └───┬────────┬───────┘
-                    │ origin,      │        ┌──────────────┐       │        │
-                    │ per-region   │        │ SEARCH/GEO   │       ▼        ▼
-                    └──────┬───────┘        │ FST prefix + │  ┌─────────┐ ┌──────────────┐
-                           │                │ fuzzy index  │  │ ROUTING │ │ ETA SERVICE  │
-                           │                │ shards,      │  │ CRP graphs│ │ (ML model +  │
-                           │                │ POI store    │  │ per region│ │ speed layer) │
-                           │                └──────────────┘  └────┬────┘ └──────┬───────┘
-                           │                                       │             │
-                           │          ┌────────────────────────────┘             │
-                           │          ▼                                          │
-                           │   ┌─────────────────┐    weights refresh   ┌─────────┴───────┐
-                           │   │ ROAD GRAPH STORE│◄────────────────────│ SEGMENT-SPEED │
-                           │   │ packed graph +  │    (30–60 s)        │ STORE (RAM)   │
-                           │   │ CRP hierarchy,  │                     └───────┬───────┘
-                           │   │ per region      │                             │
-                           │   └───────┬─────────┘                             │
-                           │           │ map-edit triggers                     │ re-extract + re-customize
-                           ├───────────┘                                       │
-                           ▼                                                   ▼
-              ┌──────────────────────────────────────────────────────────────────────────┐
-              │              MAP-DATA PIPELINE (offline, region-sharded)                  │
-              │  source imagery/surveys → feature extraction → road graph build →         │
-              │  tile render farm (raster pregeneration) → tile store → CDN backfill      │
-              └──────────────────────────────────────────────────────────────────────────┘
+Q: How do the three serving paths (tiles, search, directions) and the live-traffic loop share their stores?
 
-   ┌───────────────────────────────────────────────────────────────────────────────────────┐
-   │                    LIVE TRAFFIC PIPELINE (realtime, region-sharded)                    │
-   │  GPS pings (2.5M/s peak) → ingest bus (partitions = geo shards) →                      │
-   │  coarse filter → MAP MATCHER (HMM per session-window) → segment aggregator →           │
-   │  SEGMENT-SPEED STORE ─→ CRP customization (minutes) ─→ routing + ETA                   │
-   └───────────────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    u((🧑 users<br/>driving · browsing)) ==>|"GET /tile/{z,x,y}<br/>HTTPS · protobuf"| cdn[🌍 edge POPs<br/>tile cache hit ≈95%]
+    cdn -->|"GET /tile/{z,x,y}?epoch=N<br/>HTTPS · protobuf"| tile[tile service<br/>raster + vector origin<br/>keyed by epoch]
+    u -->|"GET /v1/search<br/>HTTPS · JSON"| gf[geo-frontend<br/>auth · throttle · S2 prior]
+    gf -->|"gRPC Search(query · S2 bias)<br/>gRPC · proto"| srch[search + geocode<br/>FST prefix + fuzzy per region]
+    srch -->|"GET place:{place-id}"| poi[(POI store<br/>by place id)]
+    u -->|"GET /v1/directions<br/>HTTPS · JSON"| gf
+    gf -->|"gRPC GetDirections()<br/>gRPC · proto"| dir[directions service<br/>CRP search · 3 alternatives]
+    dir -->|"map-match endpoints<br/>CRP query · pinned weight snapshot"| rout[(routing graph<br/>packed + CRP hierarchy)]
+    dir -->|"gRPC DecorateLegs()<br/>gRPC · proto"| eta[ETA service<br/>ML model + speed layer]
+    eta -->|"read speed:{segment-id}"| spd[(segment-speed store<br/>RAM · S2 shard · versioned)]
+
+    rout -->|"read speed:{segment-id}"| spd
+    u -.->|"produce: gps.ping"| bus{{📨 ingest bus<br/>GPS pings · geo shards}}
+    bus -.->|"consume: gps.ping"| mm[map matcher<br/>coarse filter → HMM session window]
+    mm -.->|"produce: segment.matched"| agg[segment aggregator<br/>rolling speed per segment]
+    agg -->|"write speed:{segment-id}"| spd
+    agg -.->|"publish: cell congestion<br/>traffic color layer"| cdn
+    pipe[map-data pipeline<br/>imagery → graph → tile render<br/>region-sharded · re-customizes rout] -->|"PUT /tiles/{epoch}<br/>HTTPS · protobuf"| tile
+    pipe -.->|"write region graph edits"| rout
 ```
 
 ## Components

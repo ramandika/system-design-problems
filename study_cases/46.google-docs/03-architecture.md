@@ -2,34 +2,25 @@
 
 ## Diagram
 
-```
-   EDITOR CLIENTS (web/desktop/mobile)
-     │  local mirror + op queue + transform engine + incremental layout
-     │  (multi-tab = two independent clients)
-     ▼
- ┌─────────────────────────────────────────────────────────────────────┐
- │ COLLABORATION SERVICE  (per-doc sequencer, sharded by doc ID)       │
- │  WORM op log: append ops (client_rev → server_rev), CAS per client  │
- │  broadcaster: fanout to subscribed sessions (per-doc channel)       │
- │  compactor: periodic log replay → snapshot every ~1K ops / ~1 h     │
- │  ACL check at open + live permission revocation                     │
- └──────┬───────────────────────────┬─────────────────────────┬────────┘
-        │ ops (durable)             │ presence (ephemeral)    │ events
-        ▼                           ▼                         ▼
- ┌──────────────┐          ┌────────────────┐        ┌───────────────────┐
- │ DOC STORE    │          │ PRESENCE HUB   │        │ EVENT BUS          │
- │ snapshots    │          │ pub/sub, TTL'd,│        │ (../13.kafka):     │
- │ + op logs +  │          │ rate-limited   │        │ comments, sharing, │
- │ history tiers│          │ (no durability)│        │ change → notify    │
- └──────────────┘          └────────────────┘        └─────────┬─────────┘
-        ▲                                                      ▼
- ┌──────────────┐                                   ┌────────────────────┐
- │ SEARCH/INDEX │                                   │ NOTIFICATIONS (    │
- │ metadata,    │                                   │ email/push, dedup, │
- │ comments     │                                   │ throttled — ../42) │
- └──────────────┘                                   └────────────────────┘
-        READER CLIENTS: ACL → snapshot+recent ops → view-only session
-        (viewers receive coarse progress, not the op stream)
+Q: How does an edit go from a keystroke to every collaborator's screen — ordered, durable, and with presence kept separate?
+
+```mermaid
+flowchart LR
+    ed((🧑 editors<br/>local mirror · op queue<br/>transform engine · incremental layout)) <-->|"op.append @ rev N · broadcast new_op @ rev M + ack<br/>wss · JSON"| cs[collab service<br/>per-doc sequencer<br/>transform → broadcast → compact]
+    rd((🧑 readers)) -->|"GET /open<br/>HTTPS · JSON"| cs
+    cs -->|"CAS append ops"| ds[(🪣 doc store<br/>snapshots · op logs<br/>hot ops + cold history)]
+    cs -->|"put snapshot @ rev N<br/>snapshot + op batch"| ds
+    cs -->|"read: snapshot @ rev N + ops (N→head)"| ds
+    cs -->|"GET /acl/{docId}<br/>HTTPS · JSON"| ac[🔑 ACL service<br/>per-doc + link-sharing]
+    ac -.->|"produce: acl.changed"| k{{📨 event bus<br/>doc + ACL change events}}
+    k -.->|"consume: acl.changed"| cs
+    ed -.->|"presence.cursor @ 1–2 Hz<br/>wss · JSON"| ph[presence hub<br/>ephemeral cursors · TTL ~3–10 s · rate-limited]
+    ph -.->|"cursors @ 1–2 Hz<br/>wss · JSON"| ed
+    cs -.->|"produce: doc.changed"| k
+    k -.->|"consume: doc.changed"| nt[🔔 notifications<br/>dedupe · throttle per user]
+    k -.->|"consume: doc.changed"| si[(🔍 search index<br/>metadata · comments)]
+    k -.->|"consume: doc.changed"| ct[comment threads<br/>anchor-keyed threads<br/>remap anchors on edits]
+    nt -.->|"notify: doc.updated<br/>email · push"| rd
 ```
 
 ## Components
@@ -69,7 +60,7 @@ sessions → a demoted editor's next op is rejected and their channel downgraded
 ## Where the money is
 
 - The collaboration service is a *sequencer with a WAL*, not a document database — per-doc
-  sharding + append-only op log + periodic snapshots; everything else (history, export,
+  sharding + append-only op log + periodic snapshots (~every 1K ops); everything else (history, export,
   search, notifications) is *derived* from that stream (one source of truth, many consumers —
   the same posture as [42.linkedin](../42.linkedin/README.md)'s "state machine authoritative,
   everything downstream derived").

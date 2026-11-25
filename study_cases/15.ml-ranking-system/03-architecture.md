@@ -2,40 +2,38 @@
 
 ## High-level diagram
 
-```
-                                   SERVING PATH (p99 ~100 ms budget)
- client ──(user_id, context, surface)──▶ API/edge
-                                            │
-              ┌─────────────────────────────▼──────────────────────────────┐
-              │  RETRIEVAL (candidate generation)  ~10 ms                  │
-              │  ┌──────────────┐ ┌──────────────┐ ┌─────────────────────┐ │
-              │  │ two-tower ANN│ │ graph/co-watch│ │ trending & fresh    │ │
-              │  │ shard fleet  │ │ candidate DB │ │ source (<15min items│ │
-              │  │ (HNSW or IVF)│ │ (item→items) │ │  not in ANN yet)    │ │
-              │  └──────┬───────┘ └──────┬───────┘ └─────────┬───────────┘ │
-              │         └────────────────┴──── merge/dedupe ─┘ → ~2,000 cands
-              └─────────────────────────────┬───────────────────────────────┘
-                                            │
-              ┌─────────────────────────────▼──────────────────────────────┐
-              │  FEATURE ASSEMBLY  ~10–15 ms                               │
-              │  user features (profile store, per-request)                │
-              │  item features: precomputed stats + realtime counters      │
-              │  (mixed freshness tier, cached embeddings)                 │
-              └─────────────────────────────┬───────────────────────────────┘
-                                            │  batched feature vectors
-              ┌─────────────────────────────▼──────────────────────────────┐
-              │  HEAVY RANKER  ~20–40 ms                                   │
-              │  DNN (multi-objective: watch, skip, like) over 2K cands    │
-              └───────────────┬────────────────────────────────────────────┘
-                              │  predicted scores
-              ┌───────────────▼────────────────────────────────────────────┐
-              │  RE-RANK + FILTERS  ~5–10 ms                               │
-              │  policy filters (seen/dedupe/policy verdicts/do-not-rank)  │
-              │  diversification (author/topic), freshness inject,         │
-              │  exploration slot allocation (bandit), blend ads/relateds  │
-              └───────────────┬────────────────────────────────────────────┘
-                              ▼  ~50 ranked items (ordered, position-tagged)
-                          back to client
+Q: How does a ranking request fan out through retrieval, feature assembly, the heavy ranker and re-rank filters inside ~100 ms?
+
+```mermaid
+flowchart LR
+    subgraph ret [Retrieval · ~10 ms]
+        ann[two-tower ANN fleet<br/>sharded IVF / brute-force]
+        gph[graph / co-watch source<br/>item→items lists]
+        frsh[trending + fresh source<br/>minutes-to-hours-old items]
+        mg[merge / dedupe<br/>cap ~2,000]
+    end
+    u((🧑 client<br/>user_id · context · surface))
+    ap[API / edge<br/>p99 ~100 ms budget]
+    fa[feature assembly<br/>user row + item multi-gets<br/>mixed freshness tier]
+    up[(user profile store<br/>one row per user)]
+    it[(item feature store<br/>precomputed stats · realtime counters<br/>cached embeddings)]
+    rk["🧠 heavy ranker<br/>DNN multi-objective<br/>P(watch) · P(skip) · P(like)"]
+    rr[re-rank + filters<br/>policy · diversify · explore<br/>→ 50 ordered items]
+    el{{📨 event log<br/>impressions · feedback<br/>position · model version}}
+    u ==>|"1· POST /rank<br/>HTTPS · JSON"| ap
+    ap -->|"gRPC Retrieve()<br/>gRPC · proto"| ann
+    ap -->|"gRPC Retrieve()<br/>gRPC · proto"| gph
+    ap -->|"gRPC Retrieve()<br/>gRPC · proto"| frsh
+    ann -->|"candidate ids"| mg
+    gph -->|"candidate ids"| mg
+    frsh -->|"candidate ids"| mg
+    mg -->|"2· gRPC Candidates()<br/>~2,000 cands · proto"| fa
+    fa -->|"GET profile:{uid}"| up
+    fa -->|"MGET item batches · 128-256 keys"| it
+    fa -->|"3· gRPC Score()<br/>packed vectors · proto"| rk
+    rk -->|"gRPC Scores()<br/>predicted scores · proto"| rr
+    rr -.->|"produce: impression<br/>position · model version"| el
+    el -.->|"consume: watch/impression events<br/>streaming counters"| it
 ```
 
 ```

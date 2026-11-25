@@ -6,31 +6,32 @@ touches your application servers.
 
 ## Diagram
 
-```
- UPLOAD PATH (write)
- Creator ──► Upload/Edge POP ──► Ingest Store (object storage)
-                    │                  │
-                    │                  ▼
-                    │           Transcoding Pipeline (async DAG, autoscaled workers)
-                    │                  │  produces: renditions (480p..1080p+), thumbnails, captions,
-                    │                  │            keyframes/diagnostics, audio-only
-                    │                  ▼
-                    │           Metadata + Storage Catalog DB  ("video X = these files")
-                    │                  │
-                    ▼                  ▼
-              publish event ──► Search/Rec indexing ──► CDN pre-warm (best-effort)
+View-count telemetry (the write side of the like/view counters, and the full event
+pipeline behind them) is out of this bytes-flow diagram's question; it is designed in
+deep dive 5 (View counts & metadata at billions-scale) below.
 
- WATCH PATH (read)  — 90%+ of design effort
- Viewer ──► Global LB / DNS geo-route
-              │
-              ├─► Video App servers ──► Metadata DB / Cache (video meta, view counts, comments)
-              │        │
-              │        └─► picks playback file set + URLs
-              │                    │
-              ▼                    ▼
-          CDN edge POP  ◄──────── signed URLs / HTTP-range segments
-              │
-              └─► cache miss ──► Mid-tier cache ──► Origin blob store (hot) ──► Cold archive
+Q: How do upload bytes and watch bytes flow — what touches the app servers, and what only crosses the CDN?
+
+```mermaid
+flowchart LR
+    cr((🧑 creator)) -->|"PUT /upload<br/>HTTPS · chunked resumable"| ue[upload-edge<br/>checksum · chunked resumable]
+    ue -->|"PUT raw originals"| ing[(🪣 ingest store<br/>raw originals · erasure-coded)]
+    ue -.->|"produce: video.uploaded"| k{{📨 publish events<br/>upload · video.updated}}
+    k -.->|"consume: video.uploaded"| tr[transcoder<br/>mezzanine → renditions 240p..1080p+]
+    tr -->|"GET raw originals"| ing
+    tr -->|"PUT rendition ladders"| hot[(🪣 blob store<br/>hot renditions)]
+    tr -->|"write video:{id} file set"| cat[(catalog DB<br/>video ↔ file set · availability)]
+    tr -.->|"produce: video.updated"| k
+    k -.->|"consume: video.updated"| rc[rec indexer<br/>event → index · pre-warm]
+    rc -->|"PUT video:{id} · vector"| si[(🔍 search index<br/>video text · rec vectors)]
+    ing -.->|"originals"| cold[(🪣 cold archive<br/>originals)]
+    vw((🧑 viewer)) -->|"1· GET /watch<br/>HTTPS · JSON"| lb[lb · dns<br/>geo-route]
+    lb -->|"GET /watch<br/>HTTPS · JSON"| app[app servers<br/>meta → manifest · signed URLs]
+    app -->|"GET meta"| mc[(hot cache<br/>video meta · view counts)]
+    app -->|"search / rec query"| si
+    app -->|"catalog get video:{id}"| cat
+    vw ==>|"2· GET segments<br/>HTTPS · byte-range"| cdn[/🌍 CDN<br/>media delivery/]
+    cdn -->|"origin pull: segments"| hot
 ```
 
 ## Components

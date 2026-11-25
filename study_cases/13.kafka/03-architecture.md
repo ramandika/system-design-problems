@@ -2,41 +2,27 @@
 
 ## Diagram
 
-```
-   Producers (200 services, 50K instances)
-        │  batched, compressed produce requests (per partition)
-        ▼
- ┌────────────────────────────────────────────────────────────────┐
- │                      KAFKA CLUSTER (40 brokers)                │
- │                                                                │
- │   Topic "orders"          Topic "clickstream"        ...       │
- │   P0..P119 (hottest)      P0..P119                               │
- │                                                                │
- │   each partition:  append-only log segment files on disk       │
- │   ┌───────────────┐   leader: takes appends, hands to readers  │
- │   │ broker A (ldr)│   followers: pull replicate, join ISR      │
- │   │ broker B (isr)│   ISR = replicas caught up to the leader   │
- │   │ broker C (isr)│   within replica.lag.time.max              │
- │   └───────────────┘                                            │
- │                                                                │
- │   Controller / group coordination (quorum of 3–5 nodes,        │
- │   KRaft-style): partition→broker assignment, leader election,  │
- │   no client data                                               │
- └───────┬───────────────────────────────┬────────────────────────┘
-         │  fetch (sendfile / zero-copy) │  fetch
-         ▼                               ▼
- ┌─────────────────┐             ┌──────────────────────────┐
- │ Consumer group   │            │ Other consumer groups    │
- │ (order service)  │            │ (warehouse loader,       │
- │  c1 c2 c3        │             │  fraud, alerting, ...)   │
- │  commit offsets  │             │  independent cursors    │
- │  to __consumer_  │             │                         │
- │  offsets topic   │             │                         │
- └─────────────────┘             └──────────────────────────┘
+Q: How do produce batches append to partition logs, and how do independent consumer groups consume and commit offsets?
 
- __consumer_offsets: an internal LOG itself, compacted per key
-   (group, topic, partition) → latest offset. Consumed by group
-   coordinators, read like any other log.
+```mermaid
+flowchart LR
+    subgraph cl [Kafka cluster · 40 brokers]
+        t{{📨 topic partitions<br/>500 topics · hot topic P0..P119<br/>leader + ISR followers}}
+        ctl[🗝️ controller quorum<br/>KRaft-style · 3-5 nodes<br/>assignment · leader election]
+        gcw[group coordinator<br/>membership · rebalance]
+        off{{📨 __consumer_offsets<br/>compacted per key<br/>group+partition → offset}}
+    end
+    pr((🧑 producers<br/>200 services · 50K instances))
+    cg((🧑 consumer group<br/>order service · c1 c2 c3))
+    og((🧑 other groups<br/>warehouse · streaming<br/>independent cursors))
+    pr ==>|"produce: orders<br/>batched · compressed"| t
+    t -.->|"consume: orders<br/>byte ranges via sendfile"| cg
+    t -.->|"consume: orders · clickstream"| og
+    cg -->|"JoinGroup · OffsetCommit<br/>TCP · Kafka wire protocol"| gcw
+    cg -->|"metadata refresh<br/>TCP · Kafka wire protocol"| ctl
+    gcw -.->|"produce: offset commit"| off
+    ctl -.->|"assignment metadata<br/>leadership + ISR"| cl
+    pr -->|"metadata.refresh request<br/>TCP · Kafka wire protocol"| ctl
 ```
 
 ## Components

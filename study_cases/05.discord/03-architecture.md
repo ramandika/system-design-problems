@@ -2,54 +2,29 @@
 
 ## High-level diagram
 
-```
-                      ┌────────────────────────────────────────────────┐
-                      │            CLIENT (desktop/mobile/web)         │
-                      │  websocket (gateway)  +  HTTPS/REST  +  UDP    │
-                      └──────┬──────────────────────┬──────────────┬────┘
-                             │ ws                   │ https        │ udp
-                             ▼                      ▼              ▼
-                 ┌───────────────────────┐  ┌────────────────┐  ┌──────────────┐
-   L7 LB (geo/   │  GATEWAY TIER         │  │  REST/RPC API  │  │  VOICE SFU   │
-   sticky by     │  (stateful, socket    │  │  FLEET          │  │  POOL         │
-   user hash)    │   terminator)         │  │  (stateless)    │  │  (per room)   │
-                 │  - session proc       │  │  - perms,       │  │  - opus/VP8   │
-                 │  - auth, zlib         │  │    hydrate,     │  │  - RTCP       │
-                 │  - shard assignment   │  │    mentions     │  │  - NAT/SRTP   │
-                 └──────┬────────────────┘  └───────┬────────┘  └──────┬───────┘
-                        │                           │                  │
-                        │        subscribe/publish  │                  │
-                        ▼                           ▼                  ▼
-                 ┌─────────────────────────────────────────────────────────────┐
-                 │        EVENT BUS / PUB-SUB CLUSTER  (guild- & channel-      │
-                 │        scoped topics, e.g. ch:{id}, guild:{id}, user:{id})  │
-                 └──────┬────────────────┬─────────────────┬───────────────────┘
-                        │                │                 │
-            fanout      │                │ durable         │ voice signaling
-            workers     ▼                ▼ write           │
-                 ┌────────────────┐  ┌───────────────────┐  ┌─────────────────┐
-                 │  FANOUT /      │  │  DATA-SERVICES    │  │  VOICE BACKEND  │
-                 │  NOTIFICATION  │  │  LAYER (gRPC,     │  │  (room registry,│
-                 │  SVC           │  │  consistency-hash │  │   SFU alloc,    │
-                 │  - batch sends │  │  routing per      │  │   signaling)    │
-                 │  - unread cntr │  │  channel/user)    │  │                 │
-                 └──────┬─────────┘  └─────────┬─────────┘  └─────────────────┘
-                        │                      │
-                        ▼                      ▼
-                 ┌─────────────────────────────────────────────┐
-                 │  WIDE-COLUMN MESSAGE STORE (partition key = │
-                 │  channel_id + time bucket; snowflake IDs)   │
-                 ├─────────────────────────────────────────────┤
-                 │  METADATA STORE: guilds/channels/members/   │
-                 │  roles/permissions/read-state               │
-                 ├─────────────────────────────────────────────┤
-                 │  PRESENCE CLUSTER (in-memory, ephemeral)    │
-                 ├─────────────────────────────────────────────┤
-                 │  OBJECT STORAGE + CDN (attachments, avatars)│
-                 ├─────────────────────────────────────────────┤
-                 │  SEARCH SERVICE (out of scope, interface    │
-                 │  only — receives message-index events)      │
-                 └─────────────────────────────────────────────┘
+Q: How does one message reach every socket subscribed to a channel topic — and how do voice and presence bypass that path?
+
+```mermaid
+flowchart LR
+    c((🧑 user)) <-->|"gateway ws<br/>zlib · events"| g[gateway tier<br/>stateful sockets · shard]
+    c ==>|"1· POST /channels/ch:{id}/messages<br/>HTTPS · JSON"| api[rest api<br/>perms · hydrate · mentions]
+    api -->|"2· SQL roles+overrides"| meta[(metadata store<br/>guilds · roles · read-state)]
+    api -->|"3· gRPC Append()"| ds[data services<br/>consistent-hash routing]
+    ds -->|"3· INSERT msg:{id}"| m[(🗄️ message store<br/>channel_id + time bucket)]
+    api -.->|"4· produce: MESSAGE_CREATE"| k{{📨 pub-sub cluster<br/>channel · guild · user topics}}
+    k -.->|"consume: MESSAGE_CREATE"| g
+    k -.->|"consume: MESSAGE_CREATE"| fn[fanout workers<br/>unread · push · index · moderation]
+    fn -->|"INCR unread:{uid}:{ch}"| meta
+    fn -.->|"MESSAGE_CREATE"| srch[🔍 search service<br/>assumed interface]
+    fn -.->|"mention payload"| apns[/🔔 APNs · FCM<br/>push vendors/]
+    g -->|"gRPC Heartbeat()<br/>userID"| p[presence cluster<br/>ephemeral in-memory]
+    p -.->|"produce: PRESENCE_UPDATE"| k
+    g -->|"gRPC JoinVoice()"| vb[voice backend<br/>room registry · SFU alloc]
+    vb -->|"gRPC AllocRoom()"| sfu[voice SFU<br/>opus/VP8 relay per room]
+    c <-->|"UDP opus<br/>SRTP"| sfu
+    c -->|"GET attachments/*<br/>HTTPS · blob"| cdn[/🌍 CDN<br/>media delivery/]
+    api -->|"PUT attachment:{id}"| o[(🪣 object storage<br/>attachments · avatars)]
+    cdn -->|"GET attachments/*<br/>HTTPS · blob"| o
 ```
 
 ## Components

@@ -5,50 +5,26 @@ cache-dominated read path (redirect) that we try to terminate at the edge.
 
 ## High level
 
-```
-                    CREATE (rare, ~600 QPS peak)             REDIRECT (hot, ~60K QPS peak)
-                    ────────────────────────────             ─────────────────────────────
-                     ┌───────────────┐                          ┌─────────────┐
-   long URL ───────▶ │  API service  │                          │  Browser    │
-   + custom alias?  │  - validate   │                          └──────┬──────┘
-                     │  - rate limit │◀── code ──── user ─────── sho.rt/aB3xK9
-                     └───┬──────┬────┘                                 │
-                         │      │                               1st hop: EDGE / CDN POP
-                         │      │                               (cache 302 responses for
-                         │      │                                hot codes; malware page
-                         │      │                                cache; negative cache 404s)
-                         │      │                                        │ miss
-                         │      ▼                                        ▼
-                         │   ┌─────────────────────┐            ┌──────────────────┐
-                         │   │ code-assignment      │           │ redirect service │
-                         │   │ - counter + base62   │           │ (origin)         │
-                         │   │   OR range allocator │           └───┬──────┬───────┘
-                         │   └─────────────────────┘               │      │
-                         │      │                                  │      │
-                         ▼      ▼                                  ▼      ▼
-                   ┌───────────┐  ┌────────────────┐   2nd: in-proc LRU  ──▶ hit ─ respond 302
-                   │ reserved  │  │ KV store        │        │
-                   │ word list │  │ code → long URL │◀───────┘ miss (sharded, Redis-like)
-                   │ (blocked) │  │ code → status   │ (click counter cache also here)
-                   └───────────┘  │ code → TTL      │            │ miss
-                                  └────────────────┘            ▼
-                                         ▲             3rd: KV store (cold link)
-                                         │                        │
-                                  abuse check ◀──────────────────┘
-                                  (URL scanner verdicts)          │ write-through
-                                         │                        ▼
-                                         └────────────▶ Bloom filter
-                                                        (all known codes; fast
-                                                         "definitely unknown" path)
-   CLICKS (fire-and-forget, never blocks redirect)
-   ──────────────────────────────────────────────
-   redirect service ──▶ UDP/fire-hose ──▶ Kafka-like log ──▶ aggregation stream jobs
-   (drop on backpressure)                    │                    │
-                                             │                    ├─▶ click-count store
-                                             │                    │     (per-link counters,
-                                             │                    │      daily buckets)
-                                             │                    └─▶ raw logs → analytics
-                                             └─▶ (replayable, ordered by code)
+Q: How do the rare create path and the hot redirect path reach the KV store, and where do clicks and abuse verdicts land?
+
+```mermaid
+flowchart LR
+    u((🧑 user)) ==>|"1· GET /aB3xK9<br/>HTTPS"| cdn[/🌍 edge CDN<br/>hot 302s · negative 404s/]
+    cdn -->|"2· GET /aB3xK9<br/>HTTPS"| rd["redirect svc<br/>in-proc LRU → cache → KV<br/>Bloom(known codes) → garbage-code 404"]
+    u -->|"POST /shorten<br/>HTTPS · JSON"| api[API svc<br/>validate · rate limit<br/>custom-alias claim]
+    api -->|"AllocateCode()<br/>gRPC · proto"| al[code allocator<br/>pre-allocated ranges · base62<br/>bijective scramble per epoch]
+    api -->|"GET alias"| res[(reserved words<br/>blocked aliases)]
+    api -->|"PUT code → URL"| kv[(🗄️ KV store<br/>code → URL · status · TTL)]
+    api -->|"PUT code → URL"| ca[(⚡ shared cache<br/>code → URL · status<br/>click-counter cache)]
+    api -.->|"insert: new code<br/>Bloom rebuild feed"| rd
+    rd -->|"GET code"| ca
+    rd -->|"GET code"| kv
+    ab[abuse svc<br/>URL scanner] -->|"PUT status"| kv
+    ab -.->|"purge: code<br/>cache invalidate"| ca
+    rd -.->|"3· produce: click"| k{{📨 click log<br/>drop on backpressure}}
+    k -.->|"consume: clicks"| ag[aggregation jobs<br/>rollups]
+    ag -->|"BATCH PUT rollups:{code}"| cnt[(rollup counters<br/>per-link · daily buckets)]
+    ag -->|"INCR clicks:{code}"| ca
 ```
 
 ## Components
@@ -61,7 +37,8 @@ cache-dominated read path (redirect) that we try to terminate at the edge.
 - **Code allocator**: stateless-ish service that either (a) bumps a counter and encodes
   base62, (b) hands out pre-allocated ranges like Snowflake/ZooKeeper assigns machine IDs
   (same family as [02.twitter's ID generation dive](../02.twitter/04-deep-dives.md)), or
-  (c) hashes — chosen in deep dive 1. Not on the redirect path.
+  (c) hashes — (b) with a per-code random suffix scramble inside each range is chosen in
+  deep dive 1. Not on the redirect path.
 - **KV store (system of record)**: `code → long URL + status + TTL` sharded consistently
   by code hash. Also holds `status ∈ {active, blocked, expired}` so abuse/expiry changes
   take effect without rewriting the URL. Tiny records, ~11 TB over a decade.

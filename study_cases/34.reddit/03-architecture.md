@@ -2,57 +2,115 @@
 
 ## High-level diagram
 
+This is too much for one diagram, so it is drawn as two: the write path first, then the
+read path (each diagram is self-contained and re-declares the shared nodes).
+
+Q: How does a write (post, comment, vote, mod action) reach its system of record, and who consumes the events it fans out?
+
 ```mermaid
-graph TD
+flowchart LR
     subgraph Client
-        W[Web / mobile apps]
+        w((🧑 users<br/>web · mobile))
     end
 
     subgraph Edge
-        CDN[CDN for media & static]
-        EDGE[Edge: rate limits, geo, bot checks]
+        edge[edge<br/>rate limits · geo · bot checks]
     end
 
     subgraph Services
-        GW[API gateway]
-        POST[Post service]
-        COMMENT[Comment service<br/>tree ops]
-        SUB[Community service<br/>metadata, membership, ACLs]
-        MOD[Mod service<br/>mod actions, automod engine]
-        FEED[Feed assembler<br/>ranked by sort]
-        USER[User service<br/>karma, prefs]
+        gw[gateway]
+        post[post service<br/>CRUD · flair · NSFW]
+        cmt[comment service<br/>tree ops]
+        sub[community service<br/>metadata · membership · ACLs]
+        mod[mod service<br/>mod actions · automod]
+        vapi[vote api<br/>ack after publish]
     end
 
     subgraph Ingest
-        KAFKA[Event log: votes,<br/>impressions, mod events]
-        VOTEV[Vote consumer:<br/>dedupe + apply deltas]
-        SPAM[Spam/abuse classifier<br/>stream consumer]
-        RANKC[Rank cache refill]
+        k{{📨 event log<br/>votes · content · mod events}}
+        vcon[vote consumer<br/>dedupe · apply deltas]
+        spam[spam classifier<br/>stream consumer]
     end
 
     subgraph Stores
-        PG[(Postgres: posts,<br/>comments, communities,<br/>users — system of record)]
-        CASS[(Cassandra: comment tree<br/>per post, materialized path)]
-        COUNTERS[(Vote counters<br/>per content item)]
-        VOTES[User vote ledger<br/>per user per item]
-        REDIS[(Redis: hot caches,<br/>rank lists, trees)]
-        S3[(Object store + CDN<br/>media)]
+        pg[(🐘 Postgres<br/>posts · comments · users<br/>community metadata · mod log<br/>system of record)]
+        cass[(🗄️ Cassandra<br/>comment tree per post<br/>materialized path)]
+        cnt[(vote counters<br/>per content item)]
+        led[(vote ledger<br/>per user per item)]
+        s3[(🪣 media store<br/>object storage)]
     end
 
-    W --> EDGE --> GW
-    GW --> POST & COMMENT & SUB & FEED & MOD & USER
-    POST --> PG
-    COMMENT --> CASS
-    COMMENT --> PG
-    POST --> S3
-    COMMENT -. vote events .-> KAFKA
-    POST -. vote events .-> KAFKA
-    KAFKA --> VOTEV --> COUNTERS & VOTES
-    KAFKA --> SPAM
-    KAFKA --> RANKC --> REDIS
-    FEED --> REDIS & COUNTERS & PG
-    MOD --> PG
-    MOD -. mod events .-> KAFKA
+    w ==>|"1· POST /submit<br/>HTTPS · JSON"| edge
+    edge -->|"POST /submit<br/>HTTPS · JSON"| gw
+    gw -->|"gRPC createPost()"| post
+    gw -->|"gRPC treeOps()"| cmt
+    gw -->|"gRPC membership()"| sub
+    gw -->|"gRPC modActions()"| mod
+    sub -->|"SQL community state"| pg
+    gw -->|"gRPC castVote()"| vapi
+    post -->|"SQL posts"| pg
+    post -->|"PUT media"| s3
+    cmt -->|"SQL comments"| pg
+    cmt -.->|"PUT comment rows<br/>async reconcile"| cass
+    cmt -.->|"produce: content.events"| k
+    post -.->|"produce: content.events"| k
+    mod -->|"SQL mod log"| pg
+    mod -.->|"produce: mod.action"| k
+    vapi -.->|"produce: vote.cast"| k
+    k -.->|"consume: vote.cast"| vcon
+    k -.->|"consume:<br/>content.events · vote.cast"| spam
+    k -.->|"consume:<br/>content.events · vote.cast"| mod
+    vcon -->|"INCR score:{id}"| cnt
+    vcon -->|"PUT vote:{uid}:{id}"| led
+```
+
+Q: How do a feed read and a thread read get assembled from caches and counters, and how does the event log keep those caches warm?
+
+```mermaid
+flowchart LR
+    subgraph Client
+        w((🧑 users<br/>web · mobile))
+    end
+
+    subgraph Edge
+        cdn[/🌍 CDN<br/>media · static/]
+        edge[edge<br/>rate limits · geo · bot checks]
+    end
+
+    subgraph Services
+        gw[gateway]
+        feed[feed assembler<br/>ranked by sort]
+        usr[user service<br/>karma · prefs]
+        cmt[comment service<br/>tree ops]
+    end
+
+    subgraph Ingest
+        k{{📨 event log<br/>votes · content · mod events}}
+        rc[rank cache refill]
+    end
+
+    subgraph Stores
+        pg[(🐘 Postgres<br/>posts · comments · users<br/>system of record)]
+        cnt[(vote counters<br/>per content item)]
+        rd[(⚡ Redis<br/>tree caches · rank lists)]
+        cass[(🗄️ Cassandra<br/>comment tree per post<br/>materialized path)]
+        s3[(🪣 media store<br/>object storage)]
+    end
+
+    w ==>|"1· GET /v1/feed<br/>HTTPS · JSON"| edge
+    edge -->|"GET /v1/feed<br/>HTTPS · JSON"| gw
+    gw -->|"gRPC treeOps()"| cmt
+    cmt -->|"GET tree page"| rd
+    cmt -->|"CQL prefix scan"| cass
+    gw -->|"gRPC sortQuery()"| feed
+    gw -->|"gRPC prefs()"| usr
+    feed -->|"gRPC getSubs()"| usr
+    feed -->|"MGET candidate lists"| rd
+    feed -->|"MGET scores"| cnt
+    feed -->|"SQL posts hydrate"| pg
+    s3 -->|"media · HTTPS"| cdn
+    k -.->|"consume: content.events · vote.cast · mod.action"| rc
+    rc -->|"SET rank:{subreddit}"| rd
 ```
 
 ## Components

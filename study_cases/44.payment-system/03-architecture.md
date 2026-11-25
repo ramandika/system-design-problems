@@ -2,39 +2,26 @@
 
 ## Diagram
 
-```
-   MERCHANT CODE ──► API GATEWAY ──────────────────────────────────────────────┐
-        (TLS, auth, idempotency-key interception, rate limits)                 │
-                                     │                                         │
-                                     ▼                                         │
-        ┌───────────────────────────────────────────────┐                      │
-        │ PAYMENTS SERVICE (state machine)              │                      │
-        │  create/confirm → authorize → capture → ...   │                      │
-        │  per-intent CAS transitions, idempotency store│                      │
-        └───┬──────────────┬──────────────┬─────────────┘                      │
-            │ risk pre     │ gateway call │  events                            │
-            ▼              ▼              ▼                                    │
-   ┌──────────────┐ ┌───────────────┐ ┌──────────────┐                        │
-   │ RISK / FRAUD │ │ GATEWAY       │ │ EVENT BUS    │                        │
-   │ velocity,    │ │ (per-rail,    │ │ (Kafka;      │                        │
-   │ rules+model, │ │  per-acquirer)│ │  ../13.kafka)│                        │
-   │ ~150 ms in-  │ │ card networks │ └──┬───────────┘                        │
-   │ line budget  │ └───────┬───────┘    │  fan-out to:                       │
-   └──────────────┘         │            ▼                                    │
-                            │   ┌───────────────────────────────────────┐     │
-                            │   │ LEDGER (double-entry, sharded)        │ ◄───┘
-                            │   │ immutable postings; balance rollups   │
-                            │   └───────────┬───────────────────────────┘     │
-                            │               ▼                                 │
-                            │   ┌───────────────────────┐  ┌──────────────┐  │
-                            │   │ TOKENIZATION VAULT    │  │ WEBHOOKS SVC │  │
-                            │   │ (PAN never lands here)│  │ signed retry │  │
-                            │   └───────────────────────┘  └──────────────┘  │
-                            ▼
-        ┌────────────────────────────────────────────────────────────┐
-        │ RECONCILIATION: acquirer/scheme settlement files (daily)   │
-        │ match → ledger; breaks → queue with remediation playbooks  │
-        └────────────────────────────────────────────────────────────┘
+*Q: How does one charge intent get authorized, posted, and reconciled — and what sits at the seam to the banks?*
+
+```mermaid
+flowchart LR
+    m((🧑 merchant)) ==>|"1· POST /v1/charges<br/>HTTPS · JSON"| gw[api-gateway<br/>TLS termination · idempotency-key interception]
+    gw -->|"2· GET idem:key · INSERT idem:key"| idem[(idempotency store<br/>key → result/in-flight · TTL ~24 h)]
+    gw -->|"3· gRPC CreateIntent()<br/>gRPC · proto"| pay[payments service<br/>create/confirm → authorize → capture<br/>per-intent CAS transitions · gateway adapters]
+    pay -->|"4· gRPC PreCheck()<br/>gRPC · proto"| rk[risk service<br/>velocity · rules+model<br/>≤ ~150 ms inline]
+    pay -->|"5· gRPC Authorize()<br/>gRPC · proto"| ga[gateway adapters<br/>per-rail protocol + credentials<br/>timeouts · uniqueness ref to bank]
+    ga ==>|"6· Auth request + uniqueness ref<br/>per-rail HTTPS/ISO 8583"| nw[/acquirers + card networks<br/>per-rail · per-acquirer/]
+    ga -.->|"status inquiry<br/>per-rail HTTPS/ISO 8583"| nw
+    sw[expiry sweeper<br/>re-auth → release hold] -.->|"re-auth / release hold<br/>gRPC · proto"| pay
+    pay -->|"7· INSERT postings"| led[(ledger<br/>immutable double-entry postings<br/>account-sharded · balance rollups)]
+    pay -.->|"produce: charge.succeeded"| k{{📨 Kafka<br/>payment events}}
+    k -.->|"consume: charge.succeeded"| wk[webhooks service<br/>signed events · retry w/ backoff]
+    wk -->|"POST /webhooks/charge<br/>signed · HTTPS · JSON"| m
+    nw -.->|"PUT /settlement/{acquirer}/{date}<br/>SFTP · CSV"| rec[reconciliation<br/>match settlement files → breaks queue]
+    rec -->|"SQL match by scheme-ref + amount<br/>INSERT correction postings"| led
+    led -->|"SQL payout-eligibility view"| po[payouts<br/>bank payouts · statement match]
+    cu((🧑 cardholder)) -.->|"card capture (client-side)<br/>HTTPS · JSON"| vl[(🔑 vault<br/>token ↔ PAN · isolated credentials<br/>no bulk read path)]
 ```
 
 ## Components

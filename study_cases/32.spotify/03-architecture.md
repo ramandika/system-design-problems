@@ -8,43 +8,48 @@ stays authoritative over *what may be played*.
 
 ## Diagram
 
-```
- CONTROL PLANE (every track start touches it)
+Q: What does one 300 ms track start touch, and how do rights reach both the audio stream and the offline client?
 
- Client (SQLite metadata cache + audio cache + prefetcher)
-   │  HTTPS, ~long-lived
-   ▼
- API Gateway / session service ────────────────► Auth + entitlement (premium? region?)
-   │            │
-   │            ├─► Catalog service ◄──────────── Ingest/ETL (label feeds, daily + incremental)
-   │            │      │  metadata: track/artist/album/playlists/podcasts
-   │            │      │  + RIGHTS FLAGS (region, tier, expiry)  [see deep dive 6]
-   │            │      ├──► Search cluster (typeahead + ranked) [deep dive 5]
-   │            │      └──► CDN URL issuer (short-TTL signed URLs, per-region allow/deny)
-   │            │
-   │            ├─► Playlist service ◄─── collaborative edits, follows, activity feed
-   │            │      [deep dive 4; event-bus backed for cross-device push]
-   │            │
-   │            └─► Player-state service (queue, "now playing", resume points)
-   │
-   └──► Recommendation/ranking (homeline, autoplay, related) ──► writes popularity telemetry
+```mermaid
+flowchart LR
+    u(("🧑 user<br/>client: SQLite meta cache · audio cache · encrypted offline store<br/>prefetch · op → local merge · rights revalidate"))
+    gw[api gateway / session<br/>auth → entitlement → region stamp]
+    ent["🔑 entitlement<br/>may user U in region R play T on tier K<br/>fail-closed"]
+    cat["catalog svc<br/>track · artist · podcast metadata<br/>rights flags: region · tier · expiry"]
+    sr["🔍 search cluster<br/>typeahead + ranked"]
+    pl[playlist svc<br/>CRUD · op log · device push]
+    ps[player-state svc<br/>queue · now playing · resume]
+    iss[CDN URL issuer<br/>short-TTL signed URLs<br/>bound to track · rendition · region]
+    rec[reco / ranking<br/>homeline · autoplay · related]
+    etl[ingest / ETL<br/>label feeds → dedup → rights flag]
+    ev{{"📨 event bus<br/>playlist ops · rights changes"}}
+    pe["playback edge<br/>regional gateway: CDN vs own POP"]
+    cdn[/"🌍 third-party CDN<br/>audio files · byte range"/]
+    pop[Spotify edge POP<br/>last-hop audio cache]
+    ob[("🪣 origin blob store<br/>audio renditions 96/160/320")]
 
- CONTENT PLANE (few bytes per request, enormous request count)
-
- Client ──► Playback edge (regional gateway: picks CDN vs own POP, signed URL)
-              │
-              ▼
-        CDN edge POPs (third-party, multi-vendor)  +  Spotify-operated POPs/peering
-              │
-              ▼
-        Mid-tier caches ──► Origin blob store (audio renditions)   [07.blob-store]
-
- OFFLINE PATH (client-authoritative bytes, server-authoritative rights)
-
- Playlist/library service ──► "sync contract" (what to download)
- Client download manager ──► CDN (audio blobs) ──► encrypted offline store (expiry-tagged)
-                 ▲
-                 └──────── periodic revalidation of rights, even offline ────── (deep dive 2)
+    u ==>|"1· GET /v1/track-bundle<br/>HTTPS · JSON"| gw
+    gw -->|"2· GET /catalog/{id}<br/>HTTPS · JSON"| cat
+    gw -->|"3· gRPC Evaluate(T,U,R,K)<br/>gRPC · proto"| ent
+    gw -->|"4· POST /signed-urls<br/>HTTPS · JSON"| iss
+    gw -->|"GET /search?q<br/>HTTPS · JSON"| sr
+    gw -->|"GET /player-state<br/>HTTPS · JSON"| ps
+    gw -->|"GET /homeline<br/>HTTPS · JSON"| rec
+    etl -.->|"batch feed: metadata + rights<br/>daily file · TSV"| cat
+    cat -.->|"produce: rights.changed"| ev
+    u -.->|"produce: play.telemetry"| ev
+    u -->|"POST /playlists/{pid}/ops<br/>HTTPS · JSON"| pl
+    pl -.->|"produce: playlist.op"| ev
+    ev -.->|"consume: playlist.op"| u
+    ev -.->|"consume: rights.changed"| u
+    ev -.->|"consume: rights.changed"| iss
+    ent -->|"rights-mask lookup (T,R,K)<br/>gRPC · proto"| cat
+    u -->|"GET /playlists/{pid}/next-items<br/>HTTPS · JSON"| pl
+    u -->|"5· GET /audio/{id} range<br/>HTTPS · binary"| pe
+    pe -->|"GET /audio range<br/>HTTPS · binary"| cdn
+    pe -->|"GET /audio range<br/>HTTPS · binary"| pop
+    pop -->|"GET audio/{track}-{rendition}"| ob
+    cdn -->|"GET audio/{track}-{rendition}"| ob
 ```
 
 ## Components

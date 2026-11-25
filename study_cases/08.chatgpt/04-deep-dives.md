@@ -111,6 +111,54 @@ slow-reader hold — a user who stops reading doesn't stop the stream (they migh
 the stop button is a first-class cancellation that frees the batch slot *immediately*;
 forgetting this strands GPU memory for the full max-token horizon).
 
+The whole turn as one sequence, with the ordering that matters — every hard gate sits
+*before* GPU work, and each failure after that point only costs money or a degraded tail,
+never correctness (cache miss → deep dive 3, quota/shed → deep dive 4, version pin →
+deep dive 5, output halt → deep dive 6):
+
+Q: What checks run, in what order, before any GPU work starts on one user turn — and what does a gate rejection, a prefix-cache miss, or a mid-stream halt cost?
+
+```mermaid
+sequenceDiagram
+    actor U as user
+    participant GW as Edge gateway<br/>auth · ~100M conns
+    participant CS as Conversation service<br/>build context window · prefix id
+    participant DS as Conversation store<br/>durable turns
+    participant AG as Admission gate<br/>token quota · inline moderation
+    participant IP as Inference pool<br/>scheduler · prefill+decode · KV prefix cache
+    participant SA as Stream assembly<br/>token forwarding · writes final turn
+
+    U->>GW: 1· POST /v1/turn (user msg)<br/>SSE held · JSON
+    GW->>CS: 2· gRPC AppendTurn(user msg)
+    CS->>DS: user turn append (KV put)
+    CS->>DS: 3· GET turns[conv_id] last N
+    DS-->>CS: stored turns
+    CS->>AG: 4· gRPC Admit(prompt tokens · prefix id · model v pin)
+    alt quota exceeded or moderation rejects input
+        AG-->>CS: refusal (quota or policy)
+        CS-->>GW: refusal
+        GW-->>U: refusal notice — ~zero GPU-seconds spent
+    else admitted
+        AG->>IP: 5· gRPC EnqueuePrompt(prompt · prefix id · pinned v)
+        IP->>IP: KV lookup prefix id (affinity table)
+        alt prefix cache hit
+            IP->>IP: prefill new tokens only
+        else cache miss or holding worker died
+            IP->>IP: full prefill — recompute fallback
+        end
+        loop until stop or max tokens
+            IP->>SA: token deltas
+            SA->>GW: forwarded deltas
+            GW->>U: SSE token deltas
+        end
+        opt streaming halt — high-severity classifier trips
+            IP->>SA: tail replaced with refusal notice
+            GW->>U: truncated stream + notice
+        end
+        SA-)DS: completed turn text (async write)
+    end
+```
+
 ## 3. Conversation context: KV-cache reuse vs recompute
 
 Every turn re-sends the conversation. Turn 20 of a chat re-prefills ~19 prior turns worth

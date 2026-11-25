@@ -2,33 +2,38 @@
 
 ## Mermaid diagram
 
+*Q: How does the offline-first client keep local state authoritative while staying in sync, and how does a reminder reach it?*
+
 ```mermaid
-flowchart TB
+flowchart LR
   subgraph Client["Client (this case)"]
-    UI["UI layer<br/>day/week/month/agenda views<br/>interaction (create, drag, edit)"]
-    SEL["Selectors / derived view model<br/>expand occurrences for range<br/>pack slots per day column"]
-    CH["Change hub<br/>(store deltas as versioned notifies)"]
-    LS["Local store (SQLite/IndexedDB)<br/>events, exceptions, masters,<br/>metadata, tombstones"]
-    SYNC["Sync engine<br/>outbox + token pull + reconcile<br/>conflict resolution"]
-    EXP["Expansion cache<br/>(RRULE -> occurrences per window)"]
-    NOTIF["Notification presenter<br/>(dedupe, display, acknowledge)"]
+    ui["UI layer<br/>day/week/month/agenda views<br/>create · drag · edit"]
+    sel["Selectors / derived view model<br/>occurrences for range → slots per day column"]
+    hub["Change hub<br/>store deltas as versioned notifies"]
+    ls[("Local store · SQLite/IndexedDB<br/>events · exceptions · masters<br/>tombstones · sync tokens · outbox")]
+    sync["Sync engine<br/>push loop: drain outbox in client-op order<br/>pull loop: pull(token) → reconcile"]
+    exp[("Expansion cache<br/>RRULE → occurrences per window<br/>key: master_id × window_bucket")]
+    bell["🔔 Notification presenter<br/>dedupe · display · acknowledge"]
   end
   subgraph Server["Server contract (given, not designed here)"]
-    API["Sync API<br/>pull(token) / push(ops)"]
-    PCH["Push channel<br/>(FCM/APNs/WS: 'changes exist')"]
-    NP["Notification pipeline<br/>(decides fire times, sends pushes)"]
+    api["Sync API<br/>pull(token) / push(ops)"]
+    pch["🔔 Push channel<br/>FCM/APNs/WS · sync hints · reminder payloads"]
+    np["Notification pipeline<br/>computes fire times from server event copy (given) → schedules pushes"]
   end
-  UI --> SEL
-  SEL --> CH
-  CH --> SEL
-  CH --> LS
-  LS --> EXP
-  EXP --> SEL
-  UI --> NOTIF
-  SYNC <-->|"mutations queued (outbox)"| LS
-  SYNC <-->|"pull deltas, push ops"| API
-  SYNC <-->|"invalidate, pull"| PCH
-  API <--> NP
+  ui --> sel
+  sel --> hub
+  hub --> sel
+  ls -->|"changed keys · versioned"| hub
+  exp -->|"SQL masters in window"| ls
+  hub -->|"master_id keys"| exp
+  sel -->|"query: window a–b"| exp
+  ui -->|"optimistic event row + outbox op<br/>one SQLite tx"| ls
+  sync -->|"apply deltas + persist token<br/>same SQLite tx"| ls
+  sync ==>|"1· POST /sync/push<br/>HTTPS · JSON · client op IDs"| api
+  sync -->|"2· POST /sync/pull?token<br/>HTTPS · JSON"| api
+  pch -.->|"consume: sync.hint<br/>push · no payload"| sync
+  np -.->|"per-device push schedule"| pch
+  pch -.->|"consume: reminder.push<br/>push · JSON"| bell
 ```
 
 ## Client components

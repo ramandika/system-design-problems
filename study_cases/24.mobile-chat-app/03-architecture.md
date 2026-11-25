@@ -2,41 +2,42 @@
 
 ## Component diagram (client process + given server fleet)
 
-```
-        ┌────────────────────────────────  MOBILE PROCESS  ────────────────────────────────┐
-        │                                                                                   │
-        │  ┌──────────────┐     ┌────────────────────┐      ┌──────────────────────────┐  │
-        │  │  UI layer    │◄───►│  Conversation      │      │  Upload manager          │  │
-        │  │ (list/chat/  │     │  controller        │---►  │  chunker, resume ledger, │  │
-        │  │  compose)    │     │  (render queue,    │      │  content-hash idempotency│  │
-        │  └──────┬───────┘     │   send pipeline)   │      └──────────┬───────────────┘  │
-        │         │             └───────┬────────────┘                 │                  │
-        │         ▼                     ▼                              ▼                  │
-        │  ┌─────────────────────────────────────────┐   ┌──────────────────────────┐   │
-        │  │  Local store: SQLite (system of record) │   │  Media cache (files, LRU │   │
-        │  │  messages, conversations, send queue,   │   │  cap ~2 GB)              │   │
-        │  │  sync cursor, pending uploads, prefs    │   └──────────────────────────┘   │
-        │  └───────────────────┬─────────────────────┘                                  │
-        │                      │ (migrations run here: version chain)                    │
-        │  ┌───────────────────▼─────────────┐   ┌──────────────────────────────────┐   │
-        │  │  Sync engine                    │   │  Crypto layer                    │   │
-        │  │  per-conversation sequence gap  │   │  key store ↔ OS keystore/KSP,    │   │
-        │  │  detection, gap fill, dedup     │   │  prekey stock, ratchet state,    │   │
-        │  └───────────────────┬─────────────┘   │  multi-device session mgmt       │   │
-        │                      │                 └────────────────┬─────────────────┘   │
-        │  ┌───────────────────▼────────────────────────────────────┐  │             │
-        │  │  Connection manager (state machine)                     │  │             │
-        │  │  socket lifecycle, push handoff, jittered backoff       │  │             │
-        │  └───────┬───────────────────────┬────────────────────────┘  │             │
-        │          │                       │                            │             │
-        └──────────┼───────────────────────┼────────────────────────────┼─────────────┘
-                   │ socket (foreground)   │ push (background)          │ HTTPS (uploads)
-                   ▼                       ▼                            ▼
-        ┌──────────────────┐   ┌──────────────────┐        ┌──────────────────────────┐
-        │ Socket gateway   │   │ Push service     │        │ Blob store (given; case  │
-        │ + delivery svc   │   │ (APNs / FCM)     │        │ 07; see 07.blob-store)   │
-        │ (GIVEN, case 03) │   │ (GIVEN)          │        │                          │
-        └──────────────────┘   └──────────────────┘        └──────────────────────────┘
+Q: Can the client send, sync and upload durability-first, surviving socket loss and background dormancy?
+
+```mermaid
+flowchart LR
+    subgraph app[mobile process]
+        ui[UI layer<br/>renders from local store only]
+        ctl[conversation controller<br/>send pipeline · queued→sent acks]
+        sync[sync engine<br/>gap detect → fill → dedup]
+        conn[connection manager<br/>socket lifecycle · push handoff]
+        up[upload manager<br/>chunker · resume ledger]
+        cry[crypto layer<br/>prekeys · ratchet state]
+        st[(SQLite<br/>messages · send queue · cursors)]
+        mc[(media cache<br/>LRU cap 2 GB)]
+    end
+
+    u((🧑 user)) ==>|"composed msg"| ui
+    ui -->|"composed msg"| ctl
+    ctl -->|"SQL append queued msg"| st
+    st -.->|"row deltas"| ui
+    ctl -->|"outgoing plaintext"| cry
+    cry -->|"get · sign keys<br/>OS keystore API"| os[/🔑 OS keystore<br/>secure enclave/]
+    cry -->|"publish · fetch prekey bundles<br/>HTTPS · encrypted"| ks[🔑 key server<br/>prekey bundles · case 03 §5]
+    ctl -->|"write ciphertext"| mc
+    up -->|"read chunks"| mc
+    up -->|"HEAD hash · POST chunks<br/>HTTPS · byte-range"| blob[(🪣 blob store<br/>chunks keyed by content hash)]
+    up -->|"POST commit upload-id<br/>HTTPS"| blob
+    up -->|"SQL resume-ledger ACKs"| st
+    ctl -->|"queued msg"| conn
+    conn <-->|"WS msgs seq'd<br/>wss · encrypted JSON"| gws[gwsvc<br/>socket gateway · delivery service<br/>per-conversation sequence]
+    conn -->|"incoming ciphertext"| cry
+    sync -->|"GET gaps since cursor<br/>HTTPS · encrypted"| gws
+    sync -->|"gap ciphertext"| cry
+    cry -->|"SQL append decrypted rows"| st
+    sync -->|"SQL write cursors"| st
+    gws -->|"POST deliver-notify<br/>HTTPS · encrypted metadata"| push[🔔 Push service<br/>APNs · FCM relay]
+    push -.->|"notification<br/>conversation-id · sender metadata"| conn
 ```
 
 ## Components and their contracts

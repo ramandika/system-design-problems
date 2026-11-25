@@ -2,49 +2,34 @@
 
 ## High-level diagram
 
-```
-                         ┌────────────────────────── clients ──────────────────────────┐
-                         │  driver app                    rider app                     │
-                         └───────┬────────────────────────────────┬───────────────────┘
-                                 │ pos updates (3–15 s)           │ quotes, requests, streams
-                                 ▼                                ▼
-                    ┌────────────────────────┐        ┌────────────────────────┐
-                    │  Edge gateway (regional)│        │  Edge gateway          │
-                    │  conn mgmt, auth,       │        │                        │
-                    │  backpressure           │        │                        │
-                    └───────┬────────────────┘        └───────────┬────────────┘
-                            │                                     │
-                            ▼                                     ▼
-        ┌────────────────────────────────┐        ┌───────────────────────────────────┐
-        │  LOCATION INGEST SERVICE       │        │  QUOTING  (fare + ETA + surge rd) │
-        │  dedupe, validate, batch       │        └──────────────┬────────────────────┘
-        └──────┬─────────────────────────┘                       │
-               │ ordered events                                  ▼
-               ▼                                    ┌──────────────────────────┐
-   ╔═══════════════════════════════╗                │  PRICING SERVICE         │
-   ║  EVENT LOG (Kafka-style,      ║                │  fare calc, surge tiles  │
-   ║  partitioned by city/driver)  ║                └──────────────┬───────────┘
-   ╚══█══█══█══█══█══█══█══█══█═════╝                               │
-      │            │             │       ┌────────────────────────┐│
-      │            │             └──────▶│ rollups, traces, ML    │◀┘ (events in)
-      │            │                     │ analytics (consumers)  │
-      ▼            ▼                     └────────────────────────┘
-┌───────────────┐  ┌────────────────────────────────┐   ┌────────────────────┐
-│ GEO INDEX     │  │ TRIP STATE MACHINE (per-trip)  │   │ SUPPLY/DEMAND AGG  │
-│ (in-memory,   │◀─│ requested→matched→arriving→    │──▶│ surge computation  │
-│ geo-sharded)  │  │ arrived→in-progress→completed  │   │ (per tile, windowed)│
-└───────┬───────┘  └───────┬───────────────┬────────┘   └─────────┬──────────┘
-        │                  │               │                      │
-        │ reserve/release  │ persist       │ lifecycle events     │ multipliers
-        ▼                  ▼               ▼ (ordered)           ▼
-┌────────────────────────────────┐  ┌──────────────┐   ┌────────────────────┐
-│  MATCHING ENGINE               │  │ TRIP DB      │   │ SURGE TILE STORE   │
-│ nearby query → score → offer   │  │ (quorum,     │   │ (cache + log)      │
-│ offer/accept, re-dispatch      │  │  money-record)│   └────────────────────┘
-└───────────────┬────────────────┘  └──────────────┘
-                │ offers via socket push
-                ▼
-        driver app (accept/decline) ────▶ back into TRIP STATE MACHINE
+Q: How does a ride request get matched to a driver with the right surge price, and how do driver positions flow into the geo index, trip state, and the surge control loop?
+
+```mermaid
+flowchart LR
+    d((🧑 driver app)) -->|"1· pos batch every 3–15 s<br/>WS · JSON"| gw["edge gateway<br/>regional · backpressure"]
+    r((🧑 rider app)) ==>|"2· POST /rides<br/>HTTPS · JSON"| gw
+    gw -->|"3· DispatchRide()<br/>gRPC · proto"| me["matching engine<br/>query → score → offer"]
+    gw -->|"GetQuote()<br/>gRPC · proto"| q["quoting<br/>ETA fan-out · fare assembly"]
+    q -->|"PriceQuote(dist, time, tier)<br/>gRPC · proto"| pr["pricing svc<br/>fare calc · damping + hysteresis"]
+    q -->|"GetETA(P, D) ×5–10<br/>gRPC · proto"| eta
+    gw -->|"4· PosBatch()<br/>gRPC · proto"| ing["location ingest<br/>validate → dedupe → batch"]
+    ing -.->|"produce: driver.pos"| el{{"📨 event log<br/>positions · trip lifecycle<br/>partitioned city/driver"}}
+    el -.->|"consume: driver.pos"| gi[("geo index<br/>in-memory · geo-sharded<br/>latest pos + status")]
+    me -->|"5· nearby(P, R)"| gi
+    me -->|"GetETA(P, D)<br/>gRPC · proto"| eta["ETA svc<br/>routing + drive-time<br/>vendor: Case 26"]
+    me -->|"6· offer push<br/>gRPC · proto"| gw
+    d -->|"7· accept<br/>WS · JSON"| gw
+    gw -->|"AcceptOffer(trip_id)<br/>gRPC · proto"| me
+    me -->|"reserve driver<br/>CAS"| gi
+    me -->|"8· CreateTrip(trip_id)<br/>gRPC · proto"| tsm["trip state machine<br/>one owner per active trip"]
+    tsm -->|"SQL trips"| tdb[("trip DB<br/>quorum · money-record")]
+    tsm -.->|"produce: trip.events"| el
+    el -.->|"consume: trip.events · driver.pos<br/>relay to rider + driver sockets"| gw
+    el -.->|"consume: demand events"| sda["supply/demand agg<br/>windowed counts per tile"]
+    gi -->|"gRPC SupplyCounts(tile)"| sda
+    sda -->|"gRPC TileRatios()<br/>gRPC · proto"| pr
+    el -.->|"consume: demand/supply"| pr["pricing svc<br/>fare calc · damping + hysteresis"]
+    pr -->|"GET+SET surge:{tile}"| st[("surge tile store<br/>cache + TTL")]
 ```
 
 ## Components

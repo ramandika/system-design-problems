@@ -2,51 +2,23 @@
 
 ## Diagram
 
-```
-  Member firms / brokers / market makers        Market-data subscribers
-  (colocated: same DC, kernel-bypass NICs)      (firms, vendors, retail aggregators)
-        │  FIX-like binary order msgs                 ▲ multicast (primary)
-        │  with client order IDs (clOrdID)            │ + TCP replay/recovery tier
-        ▼                                             │
- ┌─────────────────────────┐                          │
- │ ORDER GATEWAYS (N, stateless) │                     │
- │  auth, symbol/risk checks, seq-req      │           │
- │  per session; assigns gateway ID        │           │
- └───────────┬─────────────┘                          │
-             │  requests in per-gateway streams        │
-             ▼                                         │
- ┌─────────────────────────┐   stamped stream   ┌─────────────────────────┐
- │ SEQUENCER (single active,│ ─────────────────▶ │  MATCHING ENGINE         │
- │  hot standby)            │  (global seq nums,  │  one shard per symbol    │
- │  one TOTAL ORDER for     │   journaled 1st)    │  group, pinned core:     │
- │  the whole inbound stream│                     │  order book per symbol:  │
- └─────┬───────────────────┘                     │  array of price levels,  │
-       │                                         │  FIFO order list/level   │
-       │ journal: inbound + ALL outbound events  └───────┬─────────────────┘
-       ▼ (append-only, deterministic format)             │
- ┌─────────────────────────┐   events (same seq stream)  │
- │ EVENT JOURNAL            │ ◀───────────────────────────┘
- │  (local RAM buffer +     │
- │   disk segments; the      │── replay ──▶ standby matcher / recovery
- │   ONLY persisted state)   │
- └─────┬───────────────────┘
-       │ outbound event streams (sequence-stamped, from same journal)
-       ▼
- ┌──────────────────────────┐        ┌──────────────────────────────┐
- │ OUTBOUND DISPATCH         │        │ REPLAY / SNAPSHOT SERVERS    │
- │  ├─ execution reports ────┼──────▶ │ UDP multicast primary feed   │
- │  │  (per member session) │        │ (A/B redundant paths,        │
- │  ├─ drop-copy (per firm)  │        │  sequence-gapped detection)  │
- │  └─ market data feed ─────┼──────▶ └──────────────────────────────┘
- │     (BBO, depth, trades)  │
- └─────────┬────────────────┘
-           │  trade records (post-trade, async)
-           ▼
- ┌──────────────────────────┐
- │ CLEARING LINK              │  out of scope here: CCP netting/margin/
- │  (trade record handoff,    │  settlement — see 44.payment-system
- │  exact-once trade IDs)     │
- └──────────────────────────┘
+Q: How does an order become a fill and a market-data tick, all off one journaled total sequence?
+
+```mermaid
+flowchart LR
+    mf((🧑 member firms<br/>brokers · market makers<br/>colocated)) ==>|"1· order new · cancel<br/>TCP · FIX-like binary"| gw[order gateways<br/>auth → risk checks<br/>stable clOrdID]
+    gw -->|"2· validated order<br/>TCP · FIX-like binary"| sq[sequencer<br/>single active · hot standby<br/>global seq stamp]
+    sq -->|"3· produce: inbound.msg<br/>in-proc · binary"| jr{{📨 event journal<br/>inbound + outbound events<br/>one sequence space}}
+    sq -->|"4· dispatch seq N<br/>in-proc · binary"| me[matching engine shards<br/>shard groups · single-writer per symbol<br/>deterministic state machines]
+    me -.->|"produce: outbound.events<br/>acks · fills · depth"| jr
+    jr -.->|"consume: inbound msg seq N<br/>standby replay"| me
+    jr -.->|"consume: inbound msg seq N<br/>standby sequencer replay"| sq
+    jr -.->|"consume: outbound.events"| od[outbound dispatch<br/>exec reports · drop-copy · MD writer]
+    od -.->|"produce: exec.report<br/>TCP · FIX-like binary"| mf
+    od -.->|"produce: md.tick<br/>BBO · depth · trades"| md{{📨 market data feed<br/>A/B redundant multicast<br/>seq-gap detection}}
+    md -.->|"consume: md.tick<br/>UDP · 64 B binary"| su((🧑 MD subscribers<br/>firms · vendor networks<br/>~500 direct feed))
+    su -->|"GET snapshot + seq range<br/>TCP · binary"| rp[replay servers<br/>book snapshots · seq replay]
+    od -->|"gRPC SubmitTrade()<br/>proto · trade record"| cc[/clearing link<br/>CCP handoff/]
 ```
 
 ## Components

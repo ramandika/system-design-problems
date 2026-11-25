@@ -2,37 +2,23 @@
 
 ## Diagram
 
-```
-                              ┌────────────────────────────┐
-    post tweet ──► API/Fanout service ──► Tweet store (sharded by tweet_id)
-                    │                                   │
-                    │                                   │
-              is celebrity follower base ?       tweet cache (Redis,
-                    │                             hot tweets)
-          ┌───────┴───────┐
-          yes             no
-          │               │
-   enqueue to            Fanout-on-write:
-   HIGH-QUEUE  ◄──┐      fanout workers read follower list (in batches)
-          │       │         for each follower → RPUSH tweet_id into
-   Fanout workers │         their timeline cache (Redis)
-   (slow, day-scale)      │
-          │               │
-          └── writes land in timelines eventually (or: skip cache, mark)
-                    │
-                    ▼
-   read timeline ──► Timeline read service ──► Timeline cache (Redis, 
-                       │                        timeline entries = [tweet_id...])
-                       │
-                       ├─ (if user follows celebrity & fanout incomplete)
-                       │    merge: on-read fetch from "celebrity tweet index"
-                       │    (list of recent tweets by the ~k most-followed accounts)
-                       │
-                       ▼
-                    Hydration: tweet store / tweet cache
-                       │
-                       ▼
-                    Response (tweets + user objects + counts)
+Q: How does one tweet reach every follower's timeline — and what a celebrity post changes on both the write and read paths?
+
+```mermaid
+flowchart LR
+    u((🧑 author)) ==>|"POST /tweets<br/>HTTPS · JSON"| a[api · fanout<br/>validate → snowflake → write]
+    a -->|"MGET followers:{uid}"| sg[(social graph<br/>followers per user)]
+    a -->|"INSERT tweet:{id}"| ts[(tweet store<br/>sharded by tweet_id)]
+    a -.->|"produce: post.created"| q{{📨 fanout queues<br/>normal authors only · celebrities skip fanout}}
+    a -.->|"produce: post.created"| ci[(celebrity index<br/>recent tweet IDs per top account)]
+    q -.->|"consume: post.created"| w[fanout workers<br/>RPUSH timelines per follower]
+    w -->|"MGET followers:{uid}"| sg
+    w -->|"RPUSH tl:{uid}"| tl[(⚡ timeline cache<br/>tweet-id list per user)]
+    r((🧑 reader)) -->|"GET /timeline<br/>HTTPS · JSON"| s[timeline read service<br/>merge · page · hydrate]
+    s -->|"LRANGE tl:{uid} 0 200"| tl
+    s -->|"ZREVRANGE celebrities:{uid} 0 200"| ci
+    s -->|"⚡ MGET tweet:{id}"| tc[(⚡ tweet cache<br/>hot tweets)]
+    s -->|"MGET tweet:{ids} 0-199"| ts
 ```
 
 ## Components
@@ -44,7 +30,7 @@
 | Tweet cache | hot tweets (recent + viral) | ~10–20% of fleet serving ~95% of hydration |
 | Social graph service + store | who follows whom, in fanout-friendly form | follower lists per user (shardable by followed_id) |
 | Timeline cache | per-user materialized list of tweet IDs | Redis consistent-hash sharded by user_id |
-| High-fanout queue + workers | celebrity fanout, slow drip over hours | celebrity author → followers, insert timeline entries in batches |
+| High-fanout queue + workers | normal-author fanout, pipelined batches | author → followers, insert timeline entries in batches |
 | Celebrity "recent tweets" index | fallback/merge source for on-read | ~top-N most-followed accounts → their recent tweet IDs |
 | Timeline read service | merge + page timelines, handle read-your-own-writes | |
 | Search / trend pipeline | ingest tweets into search index, trends aggregation | separate DAG, can lag |
@@ -57,8 +43,9 @@ Snowflake) → synchronously return to author (read-your-own-writes: author's ow
 render merges the real store, not the cache) → async fanout workers insert into ~300
 follower timelines.
 
-**Post (celebrity)**: same write, but fanout is enqueued to a slow high-queue for drip
-insertion over minutes-to-hours. Timeline reads for anyone who follows that celebrity
+**Post (celebrity)**: same write, but fanout is skipped entirely — nothing is enqueued to
+the fanout queues, so no follower timeline is written at post time. Timeline reads for
+anyone who follows that celebrity
 MERGE: timeline-cache entries ⊕ recent-tweets-from-celebrity-index, dedup by tweet ID.
 (Real Twitter 2012 went further: no celebrity fanout queue at all — celebrity tweets were
 served purely on-read from the Earlybird search index; see

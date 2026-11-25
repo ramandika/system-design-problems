@@ -2,52 +2,39 @@
 
 ## Diagram
 
+Q: How does one sent message become K per-recipient mailbox rows plus a live push, and where do media, previews, and search leave the chat path?
+
+```mermaid
+flowchart LR
+    s((🧑 sender)) ==>|"1· SEND msg<br/>wss · JSON"| gt["connection tier<br/>persistent sockets · offline queue"]
+    gt -->|"2· gRPC SendMessage(thread, msg)<br/>proto"| cs["conversation svc<br/>per-thread canon log<br/>ordering · receipts"]
+    cs -->|"3· gRPC Fanout(msg)<br/>proto"| fs["fanout svc<br/>1 canon → K mailbox rows"]
+    fs -->|"4· PUT mailbox row {user, thread, seq}"| mb[("🗄️ per-user mailbox store<br/>rows (user, thread, seq)<br/>unread counters")]
+    rc((🧑 receivers)) -->|"GET seq > last_seen"| mb
+    gt <-->|"msg envelope<br/>wss · JSON"| rc
+    fs -.->|"produce: delivery.push"| gt
+    fs -.->|"produce: mailbox.append"| ev{{"📨 mailbox log"}}
+    ev -.->|"consume: mailbox.append"| ib["inbox svc<br/>pagination · snippets"]
+    ev -.->|"consume: mailbox.append"| si[("🔍 search index<br/>derived from mailbox")]
+    rc -->|"inbox page<br/>HTTPS · JSON"| ib
+    ib -->|"MGET user:{uid} mailbox rows"| mb
+    rc -->|"SEARCH q"| si
+    s -->|"PUT media bytes"| s3[("🪣 blob store<br/>content-hashed")]
+    s3 -->|"media bytes<br/>HTTPS"| cdn[/"🌍 CDN"/]
+    cdn -->|"media bytes<br/>HTTPS"| rc
+    cs -.->|"produce: link.preview"| pv["preview pipeline<br/>URL → title · thumb card"]
+    pv -->|"PUT blob variants"| s3
+    pv -.->|"PUT card url→thumb ref<br/>gRPC · proto"| cs
+    rc <-->|"typing · presence<br/>wss"| pr["presence cluster<br/>ephemeral best-effort"]
+    bg["third-party gateway<br/>business accounts"] -->|"POST /messages<br/>HTTPS · JSON"| cs
 ```
- SENDER CLIENTS (any of N devices)              RECEIVER CLIENTS (any of N devices)
-        │                                              ▲
-        ▼                                              │
- ┌─────────────────────┐        ┌───────────────────────┴──────────┐
- │  Gateway / connection tier                          │  (persistent sockets,
- │  (reuse WhatsApp-style: TLS, framing, ACKs,         │   push-first delivery)
- │   reconnect storms — see ../03.whatsapp/)           │
- └──────────┬──────────────────────┘                   │
-            │ (1) enqueue + assign thread sequence      │ (5) fanout push per device
-            ▼                                          │
- ┌─────────────────────┐     ┌──────────────────────────┴───────┐
- │  Conversation service│    │  Fanout service                   │
- │  (per-thread log:    │───▶│  expand sender=1 write into       │
- │  the *canon* copy,   │(2) │  K per-recipient mailbox rows     │
- │  seq, ordering)      │    │  + live push to online devices    │
- └──────────┬───────────┘    └─────────────┬─────────────────────┘
-            │            + offline ⇒ parked │
-            ▼                              ▼
- ┌────────────────────────────────────────────────────┐
- │  USER MAILBOXES — per-user sharded store            │
- │  (MyRocks/MySQL-family historically; rows keyed     │
- │  (user, thread, seq); inbox index; unread counters) │
- └──────────┬────────────────────────────┬─────────────┘
-            │ (reads)                     │ (async index)
-            ▼                             ▼
- ┌──────────────────────┐      ┌──────────────────────┐
- │ Inbox service         │      │ Search index          │
- │ thread list, unread,  │      │ (built off mailbox)   │
- │ snippets — web + apps │      └──────────────────────┘
- └──────────────────────┘
 
- MEDIA PATH (bypasses chat bytes)
- Sender ─▶ upload edge ─▶ blob store (content-hashed) ─▶ CDN ─▶ receivers
-                  │                                       ▲
-                  └─▶ preview pipeline (images: resize;   │
-                      links: fetch title/thumbnail) ──────┘
-                      (plaintext-era feature — see E2EE note)
-
- THIRD PARTIES: business accounts / platform apps ─▶ API gateway ─▶ conversation service
- ABUSE/MODERATION + ML RANKING: consume plaintext-era content stream (E2EE: unavailable)
-
- E2EE REGIME (post-migration): the plaintext-era features — mailbox canon content,
- preview fetch, server search — either keep *metadata only* or move client-side.
- (Feature-by-feature consequences: see deep dive 5 in 04-deep-dives.md.)
-```
+Outside the chat path: business accounts / platform apps write in through the third-party
+gateway; abuse/moderation and ML ranking consume the plaintext-era content stream
+(E2EE: unavailable). E2EE regime (post-migration): the plaintext-era features — mailbox
+canon content, preview fetch, server search — either keep *metadata only* or move
+client-side. Feature-by-feature consequences: see deep dive 5 in
+[04-deep-dives.md](04-deep-dives.md#5-the-e2ee-migration-what-server-truth-buys-and-what-it-costs).
 
 ## Components
 

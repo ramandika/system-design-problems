@@ -2,30 +2,29 @@
 
 ## Diagram
 
-```
- SENDER                                   RECEIVER (online)
-   │                                            ▲
-   ▼                                            │
- Chat gateway (TCP / WebSocket, E2E envelope) ──┼──► recipient chat gateway
-   │                                            │
-   │  (1) write to message store                │  (4) push over persistent socket
-   ▼                                            │
- Message store (per-conversation log; shard     │
-   key = (conversation_id), append-only)        │
-   │                                            │
-   │  (2) enqueue per-recipient queue entry     │
-   ▼                                            │
- Delivery service ──(3) if recipient online, ───┘
-                       push; if offline, park;
-                       if parked > N days,      RECEIVER (offline → later online)
-                       expire/let client pull.    ▲
-                                                  │
- Typing/online/presence ── Presence cluster ──────┘  (ephemeral, no durable storage)
+Q: What happens to one 1:1 message online vs offline, how a group message fans out — and why media takes a separate path?
 
- MEDIA (separate path)
- Sender ──► upload edge ──► blob store (content-hashed, E2E-encrypted) ──► CDN
-                                                    sender sends "key+id" in message
- RECEIVER ──── fetches from CDN ──► decrypts client-side
+```mermaid
+flowchart LR
+    s((🧑 sender)) <-->|"E2E envelope<br/>persistent TCP · binary"| cg[chat gateway<br/>sockets · framing · session registry]
+    r((🧑 receiver)) <-->|"E2E envelope<br/>persistent TCP · binary"| cg
+    kd[(🔑 key directory<br/>identity keys · prekey bundles<br/>one-time prekeys OPK)]
+    s -->|"publish own prekeys /<br/>fetch prekey bundle of receiver"| kd
+    cg ==>|"1· append envelope<br/>seq per conversation"| ms[(message store<br/>per-conversation log)]
+    cg -->|"2· gRPC deliver(msg)"| dl[delivery service<br/>route · park · expire]
+    dl -->|"3· gRPC push(envelope)<br/>to receiver's gateway"| cg
+    dl -->|"park envelope: envelope_ptr"| oq[(offline queue<br/>per-recipient · TTL 30 d)]
+    cg -->|"read parked: conv_id + seq order"| oq
+    cg -.->|"consume: message.acked"| dl
+    dl -.->|"consume: message.delivered"| cg
+    cg -->|"fanout group msg"| gf[group fanout<br/>1 group msg → per-member deliveries]
+    gf -->|"write group conversation log"| ms
+    gf -->|"deliver/park per member"| dl
+    cg -->|"gRPC UpdatePresence()<br/>proto"| p[presence cluster<br/>ephemeral · no durable store]
+    s -->|"PUT /v1/media/blobs<br/>HTTPS · chunked"| up[upload edge<br/>chunked resumable]
+    up -->|"put blob:{hash}"| b[(🪣 blob store<br/>E2E-encrypted · content-hashed<br/>client-side decrypt)]
+    b -->|"origin pull: objects<br/>HTTPS"| cdn[/🌍 CDN<br/>media delivery/]
+    r -->|"GET blob:{hash}<br/>HTTPS · ciphertext"| cdn
 ```
 
 ## Components

@@ -138,6 +138,37 @@ ledger when they disagree.
 post, additionally shard the counter by `content_id_hash + N buckets` and sum on read if a
 single counter cell still saturates (rare; only truly viral posts).
 
+The sequence below traces that path end to end (deep dive 2):
+
+Q: After a vote is acked, what does a user see while counts catch up — and what happens when an event is delivered twice or a consumer batch lags?
+
+```mermaid
+sequenceDiagram
+    actor u as 🧑 user
+    participant va as vote-api<br/>ack after publish
+    participant k as 📨 event log<br/>at-least-once
+    participant vc as vote consumer<br/>dedupe → ledger → counters
+    participant rd as ⚡ rank cache<br/>hot + rising lists
+    participant f as feed assembler
+
+    u->>va: 1· POST /api/vote<br/>HTTPS · JSON · client_request_id
+    va-)k: produce: vote.cast (user, content, direction, revision)
+    va-->>u: 202 accepted
+    k-)vc: consume: vote.cast
+    vc->>vc: OP get ledger revision (user, content)
+    alt duplicate delivery — revision ≤ applied
+        vc->>k: commit offset · event dropped
+    else newer revision — apply
+        vc->>vc: INCR score:{content} · PUT vote:{user}:{content}
+        vc-)rd: SET velocity window (content, bucket)
+    end
+    u->>f: 2· GET /api/feed?sort=hot<br/>HTTPS · JSON
+    f->>rd: MGET rank lists
+    opt counting lag — counter batch not yet flushed
+        f-->>u: scores · seconds stale · fuzzed display
+    end
+```
+
 ### Failure modes
 
 - **Brigading** (off-platform coordination inflating one content item): visible as an

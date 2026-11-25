@@ -2,30 +2,19 @@
 
 ## Diagram
 
-```
-  CLIENT ──debounce(50–100ms)──► EDGE / CDN  ─────static top-N per hot prefix───┐
-     │  (per-prefix client cache; cancel on new keypress)                       │
-     ▼                                                                          │
-  TYPEAHEAD SERVICE (stateless)                                                 │
-     │  1. normalize prefix (case/accents/tokenize)                             │
-     │  2. shard: hash(first 1–2 chars) → index node(s)                          │
-     │  3. point-lookup top-k (RAM) + hot-layer overlay merge                   │
-     │  4. hydrate strings (string cache), apply user-history overlay            │
-     ▼                                                                          │
-  ┌───────────────┐        ┌─────────────────────────────────────────────┐  │
-  │ INDEX NODES   │◄─load──│ BATCH BUILD (hourly)                        │  │
-  │ RAM top-k per │        │  query logs → normalize → decayed counts    │  │
-  │ prefix, shard │        │  → filter (policy) → materialize top-k      │  │
-  │ hash 1–2 chars│        │  → segment file → double-buffered swap      │  │
-  └───────┬───────┘        └───────────────────┬─────────────────────────┘  │
-          │                                    │                            │
-          │  ┌─────────────────────────────┐   │                            │
-          └─►│ HOT LAYER (streaming counts │◄──┘   query events                │
-             │ + trending boost, minutes-  │◄─────────────────────────────────┤
-             │ fresh, velocity guardrails  │        event bus (../13.kafka)   │
-             └─────────────────────────────┘                                  │
-                                                                              │
-              per-prefix response cache (Redis) ──coalescing, TTL by layer────┘
+Q: Where does a debounced keystroke go, and how do the cache tiers, RAM index, and hot overlay compose one answer?
+
+```mermaid
+flowchart LR
+    u((🧑 user<br/>debounce 50–100 ms · prefix cache<br/>cancel on next key)) ==>|"1· GET /suggest<br/>HTTPS · JSON"| t[typeahead service<br/>normalize → shard → overlay merge → hydrate → per-user merge]
+    u -->|"GET /snapshot/{pfx}<br/>HTTPS · JSON"| cdn[/🌍 CDN<br/>hot-prefix snapshots/]
+    t -->|"2· MGET resp:{pfx}"| rc[(⚡ Redis<br/>per-prefix answer cache<br/>TTL staggered by layer)]
+    t -->|"3· GET top-k:{pfx}"| ix[(🔍 index nodes<br/>prefix-hash sharding · top-k per prefix<br/>string-pool hydration · double-buffered segments)]
+    t -->|"4· gRPC ReadTrending(pfx)"| hb[hot layer<br/>streaming counts · trending boost<br/>policy gate · velocity guardrails]
+    t -.->|"produce: query.logged"| k{{📨 event bus<br/>post-search query logs}}
+    k -.->|"consume: query.logged"| hb
+    k -.->|"consume: query.logged"| bl[batch build<br/>decayed counts → policy filter<br/>→ top-k segments]
+    bl -->|"PUT top-k:{pfx} segment<br/>double-buffer swap"| ix
 ```
 
 ## Components

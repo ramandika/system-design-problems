@@ -2,43 +2,30 @@
 
 ## High-level diagram
 
-```text
-                          THE EVENT TIMELINE (everything depends on which phase)
-   ─────────────────────────────────────────────────────────────────────────────
-   steady (days–months)        pre-sale window         ON-SALE (minutes)         post (hours–years)
-   browse/search               waiting room opens      admission, holds,         orders, transfers,
-   low-contention buys         account pre-warm        checkout, payment         entry-validation
+Q: How does the on-sale request path move fans from the edge queue to a seat hold, checkout and the seat/order event log?
 
-   ───────────────────────────────────── REQUEST PATH ─────────────────────────────────────
-
-     fans (2M, estimate)                        admitted population (~150K)
-        │                                              ▲
-        ▼                                              │ admission token
- ┌───────────────┐   bot checks    ┌────────────────┴────────────┐   position/hold/map
- │  EDGE TIER    │────────────────▶│      WAITING ROOM SVC       │──────────────┐
- │  CDN + WAF    │                 │  · admission order (Redis   │              ▼
- │  rate limits, │                 │    ZSET, issue epochs)      │      ┌───────────────┐
- │  fingerprint  │                 │  · coarse position counters │      │ SALE FRONTEND │
- │  JS challenges│                 │  · issues signed admit      │      │ seat map UI   │
- └───────┬───────┘                 │    tokens w/ TTL            │      └───────┬───────┘
-         │                         └─────────────────────────────┘              │
-         │  catalog traffic (steady-state, other events)                        │
-         ▼                                                                      ▼
- ┌───────────────┐   cache-aside   ┌────────────────────┐   reads (cached) ┌───────────────┐
- │ CATALOG SVC   │◀───────────────▶│ DISTRIBUTED CACHE  │◀─────────────────│ INVENTORY SVC │
- │ search/events │                 │ (section aggregates│                  │ · per-event   │
- │ venue/maps    │                 │  ~1s stale)        │   atomic ops     │   shard       │
- └───────────────┘                 └────────────────────┘─────────────────▶│ · seat CAS    │
-                                                                           │ · TTL holds   │
-                                                                           └──────┬────────┘
-                                                                                  │ hold/sell events
-                                                                                  ▼
-┌────────────┐   idempotent   ┌──────────────┐   state transitions ┌───────────────────────┐
-│ PAYMENT    │◀───────────────│ ORDER SVC    │────────────────────▶│ EVENT LOG (Kafka-like)│
-│ authorize/ │   capture      │ idempotency  │  available/held/    │ immutable seat+order  │
-│ capture,   │───────────────▶│ keys, order  │  sold/returned      │ events; reaper reads  │
-│ refunds    │   webhooks     │ state machine│                     │ expired holds → reap  │
-└────────────┘                └──────────────┘                     └───────────────────────┘
+```mermaid
+flowchart LR
+    u((🧑 fans<br/>~2M at on-sale)) ==>|"1· GET /sale<br/>HTTPS · HTML"| edge[🌍 edge tier<br/>static waiting-room pages · coarse counters<br/>rate limits · fingerprint · JS challenges]
+    edge -->|"2· GET /line<br/>HTTPS · HTML"| wr[waiting room svc<br/>FCFS admission · signed tokens]
+    edge -->|"GET /catalog<br/>HTTPS · JSON"| cat[catalog svc<br/>search · venue · maps]
+    wr -->|"ZADD position · ZPOPMIN admit"| wrs[(⚡ Redis<br/>queue ZSET · coarse counters)]
+    wr -->|"3· admit handoff<br/>signed admission token · HTTPS redirect"| fe[sale frontend<br/>seat map UI · purchase caps]
+    cat -->|"GET/PUT section aggregates"| cach[(⚡ distributed cache<br/>section aggregates<br/>~1s stale)]
+    fe -->|"4· GET seat map"| cach
+    fe -->|"5· POST /hold<br/>HTTPS · JSON"| inv[inventory svc<br/>per-event shard<br/>CAS · TTL holds]
+    fe -->|"6· POST /checkout<br/>HTTPS · JSON"| ord[order svc<br/>state machine · idempotency]
+    ord -->|"POST /payments/authorize<br/>HTTPS · JSON"| psp[/payment PSP/]
+    ord -.->|"capture(hold-id) via capture consumer<br/>gRPC · proto"| psp
+    psp -.->|"POST /webhook<br/>HTTPS · JSON"| ord
+    ord -->|"commit(hold-id)<br/>gRPC · proto"| inv
+    inv -.->|"produce: seat.held"| log{{📨 event log<br/>seat + order transitions}}
+    inv -.->|"produce: hold.expired"| log
+    ord -.->|"produce: order.events"| log
+    log -.->|"consume: hold.expired"| reap[reaper<br/>release TTL holds]
+    reap -->|"release(hold-id)<br/>gRPC · proto"| inv
+    reap -.->|"produce: seat.released"| log
+    inv -->|"PUT section:aggregates"| cach
 ```
 
 ## Components

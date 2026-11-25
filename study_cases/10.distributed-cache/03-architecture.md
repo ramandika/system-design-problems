@@ -2,29 +2,45 @@
 
 ## High-level diagram (one region)
 
+## High-level diagram (one region)
+
+Q: How do reads and the two write classes (origin-backed objects vs sessions) flow through L1 and the shared sharded L2?
+
+```mermaid
+flowchart LR
+    svc[services<br/>in-process L1 · cache-aside] ==>|"1· GET key"| cl[client library / proxy<br/>slot map · hash key → shard · coalescer<br/>hit-rate metrics]
+    cl -->|"2· GET key by slot"| sh[(⚡ sharded L2 cache<br/>hash slots → shard groups<br/>1P + 2R per group)]
+    svc -->|"3· SQL SELECT key"| odb[(origin DBs<br/>system of record<br/>per service)]
+    cl -->|"4· SET key + TTL (miss refill)"| sh
+    svc -.->|"5· post-commit DEL key"| sh
+    sh -.->|"6· PUT session rows · write-behind"| fs[(session fallback store<br/>durable · replicated<br/>receive-only from hot path)]
+    fc[failover controller<br/>heartbeats · promotes replica] -->|"gRPC PromoteReplica()<br/>gRPC · proto"| sh
+    fc -.->|"produce: slot.map.update<br/>JSON"| cl
 ```
-            ┌────────────────────────── services (clients) ──────────────────────────┐
-            │  svc A            svc B            svc C            svc D              │
-            └──┬───────────────────┬──────────────────┬──────────────────┬──────────┘
-               │ in-process L1     │                  │                  │
-               ▼                   ▼                  ▼                  ▼
-        ┌────────────────────────────────────────────────────────────────────────┐
-        │                        SHARED CACHE TIER (L2)                          │
-        │  ┌───────────── client lib or proxy ─────────────┐                     │
-        │  │  slot map (key → shard) | coalescer | metrics │                     │
-        │  └───────┬──────────────┬──────────────┬─────────┘                     │
-        │          ▼              ▼              ▼                               │
-        │   ┌────────────┐ ┌────────────┐   ┌────────────┐                       │
-        │   │  shard 0   │ │  shard 1   │ … │ shard N-1  │    hash(key) → slot   │
-        │   │ P ─ R ─ R  │ │ P ─ R ─ R  │   │ P ─ R ─ R  │    slot → shard       │
-        │   └────────────┘ └────────────┘   └────────────┘                       │
-        └───────┬───────────────────────────────────────┬────────────────────────┘
-                │ miss / refresh (object class)         │ no origin for sessions
-                ▼                                       ▼
-        ┌────────────────┐                      ┌──────────────────┐
-        │ origin DBs     │  async invalidate    │ durable session  │
-        │ (per service)  │ ────(post-commit)──▶ │ fallback store   │
-        └────────────────┘                      └──────────────────┘
+
+## Failover sequence
+
+Q: What happens to in-flight requests and already-acked writes when a primary fails inside the ≤ 15 s promotion window?
+
+```mermaid
+sequenceDiagram
+    participant svc as services
+    participant cl as client library / proxy
+    participant sh as sharded L2 (1P + 2R)
+    participant fc as failover controller
+    participant fs as session fallback store
+
+    svc->>cl: GET / SET key
+    cl->>sh: GET · SET by slot
+    sh-->>cl: value · ack
+    cl-->>svc: value · ack
+    alt primary fails, promotion within 15 s
+        fc->>sh: PromoteReplica() on newest surviving replica
+        fc-)cl: slot.map.update push
+        Note over svc,cl: in-flight requests fail fast, retry or pass through to origin
+        Note over sh: object writes acked pre-replication are lost because origin rebuilds, sync-acked session writes survive
+    end
+    sh-)fs: write-behind session rows, async after ack
 ```
 
 ## Components

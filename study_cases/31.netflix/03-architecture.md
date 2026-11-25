@@ -9,43 +9,22 @@ Two halves that barely touch on the hot path, and that separation *is* the desig
 
 ## High-level diagram
 
-```
-STUDIOS / LICENSORS                                MEMBERS' DEVICES
-   |  mezzanine masters (F1)                        (TVs, phones, browsers, consoles)
-   v                                                     |
-+------------------------------------------------+      |
-| INGEST PIPELINE (batch)                        |      |
-|  validation -> normalize -> analysis pass      |      |
-|  -> transcode ladder (F2)  <- QC gate (F4)     |      |
-|  -> dub/subtitle localization (F3)             |      |
-|  -> package (manifests, DRM packaging,         |      |
-|     artwork variants)                          |      |
-+----------------+-------------------------------+      |
-                 v                                      |
-        ORIGIN STORAGE (catalog masters + renditions,   |
-        multi-region replicated, ~tens of PB)           |
-                 |                                      |
-                 |  off-peak FILL (F5): fleet pulls     |
-                 |  forecast-popular content nightly    |
-                 v                                      |
-        OPEN CONNECT CDN (data plane)         --------->|  ABR playback (F7, N1/N2)
-        OCAs inside ISPs+IXPs, prepositioned  --------->|  (client: Case 23)
-        storage, HTTP range/chunk serving               |
-                  ^                                     |
-                  | steering: pick appliance by         |
-                  | throughput+latency probes, capacity |
-                  |                                     v
-+-------------------------------------------------+ +------------------+
-| CONTROL PLANE (cloud, multi-region)             | | ENTITLEMENTS/DRM |
-|  UI/orchestration: rows, lists, profiles        | |  session check:  |
-|  recommendations: candidates + rankers (F6)     | |  subscription,   |
-|  playback service: title resolution, manifest   | |  plan limits,    |
-|    negotiation with device (codec/HDR/drm)      | |  stream count,   |
-|  per-region state: progress, My List            | |  age/geo rating  |
-|  experimentation platform (A/B everywhere)      | |  -> key server   |
-|  telemetry: QoE events -> logs/metrics/stream   | +------------------+
-|    processing -> dashboards + ML training       |     (F8, F9)
-+-------------------------------------------------+
+Q: How do the bytes reach the member from Netflix's own CDN while the control plane only brokers discovery, the manifest, and DRM?
+
+```mermaid
+flowchart LR
+    st[/"studios · licensors"/] -->|"mezzanine masters"| ip["ingest pipeline<br/>validate → ladder transcode<br/>QC → package"]
+    ip -->|"PUT packaged renditions + manifests<br/>masters + renditions"| og[("🪣 origin storage<br/>masters + renditions<br/>multi-region")]
+    fl["fill<br/>forecast-popular titles"] -->|"pull tonight's fills: renditions<br/>off-peak HTTPS"| og
+    fl -.->|"tonight's title set · renditions<br/>off-peak HTTPS"| oc["🌍 Open Connect<br/>OCA fleet · HTTP range serving"]
+    m((🧑 member device)) -->|"1· GET /ui/rows<br/>HTTPS · JSON"| cp["control plane<br/>UI rows: candidates → rank"]
+    cp -->|"SQL progress · my-list"| pg[("per-region state<br/>playback progress · my list")]
+    m -->|"2· POST /playback<br/>HTTPS · JSON"| ps["playback svc<br/>title → manifest<br/>codec/HDR/DRM negotiation"]
+    ps -->|"gRPC AuthorizeSession(sub · plan · geo)<br/>gRPC · proto"| en["entitlements + DRM<br/>subscription · plan · geo<br/>→ key server · license → CDM"]
+    ps -->|"gRPC SteerSession(titleId · device probes)<br/>gRPC · proto"| sd["steering<br/>OCA choice → steered appliance URL<br/>throughput + capacity probes"]
+    m -->|"3· POST /license<br/>HTTPS · CENC/key"| en
+    m ==>|"4· GET /titles/{id}/segments<br/>HTTP range"| oc
+    m -.->|"produce: qoe.events"| tl["telemetry<br/>QoE → dashboards + ML"]
 ```
 
 ## Components

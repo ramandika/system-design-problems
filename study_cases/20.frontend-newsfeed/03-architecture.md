@@ -8,49 +8,26 @@ The shape is dictated by three rules:
 3. **The ranker's list is a moving floor**: every pagination cursor and every insertion is
    defined against *stable anchors*, never offsets in a mutating list.
 
-```
-+---------------------------------------------------------------------------------+
-| EDGE / CDN                                                                       |
-|   static JS/CSS bundles (content-hashed, immutable) | media delivery             |
-+------------------^----------------------------------------------------------------+
-                   | bundle fetch                      (media: Case 09 CDN path)
-+------------------+-----------------+------------------------------------------------+
-| SSR STREAMING TIER (thin)          |  A/B DECIDER (assignment at the edge)          |
-|   streams above-the-fold HTML:     |    user_id -> sticky variant, embedded in the  |
-|   1-2 rendered items + inline      |    SSR payload before HTML exists in cache     |
-|   initial JSON payload (page 1,    |                                                |
-|   cursor token, variant flags)     |                                                |
-+------------------v-----------------+------------------------------------------------+
-                   | streamed HTML + inline payload
-+------------------v----------------------------------------------------------------------+
-| CLIENT                                                                                  |
-|  SHELL: bootstrap (150 KB gz budget), router, fetch cache, visibility handling          |
-|    |                                                                                     |
-|    +-> FEED STORE - append-only paged log of entries, keyed by entry_id                  |
-|    |     pages: [page1][page2]...  each pinned by a stable anchor token                  |
-|    |     dedup by entry_id (ranker churn), trimmed behind the window                     |
-|    |                                                                                     |
-|    +-> WINDER (virtualized list) - mounts viewport window + overscan (dive 1)            |
-|    |     scroll anchoring, size cache, fling-aware mount/decay                           |
-|    |                                                                                     |
-|    +-> PREFETCH MANAGER - predicts next page need, gates by network/battery (dive 3)     |
-|    |                                                                                     |
-|    +-> TOP-INSET CONTROLLER - "N new posts" pill, anchor-safe insertion (dive 4)         |
-|    |                                                                                     |
-|    +-> ISLAND REGISTRY - which components hydrate when (dive 2/5):                       |
-|    |     like/comment/share UI, video players, ads -> hydrated on idle/visibility        |
-|    |                                                                                     |
-|    +-> TELEMETRY - batched impressions + interactions, flushed on visibilitychange       |
-|    |                                                                                     |
-|    +-> EXPERIMENT CLIENT - reads edge-assigned variant, exposes, sticky log             |
-+------------|--------------------------|------------------------|------------------------+
-             | feed page + hydration    | impression/interaction | exposure beacons
-+------------v--------------------------v------------------------v------------------------+
-| BACKEND (GIVEN)                                                                          |
-|   timeline API (Case 02): page token -> ordered entry list, page ~15 items               |
-|   hydration service: entry_id -> payload (the hydrate step, Case 02 scale estimates)     |
-|   ranking/ad injection (Case 15): produces the ranked, mutating stream                   |
-+------------------------------------------------------------------------------------------+
+Q: How does one feed session paint, paginate, and insert new stories — without the scroll window growing or a cursor ever referencing a mutable offset?
+
+```mermaid
+flowchart LR
+    u((🧑 user)) ==>|"1· GET /feed<br/>HTTPS · HTML + inline page-1 JSON"| ssr[ssr-tier<br/>streams above-fold HTML<br/>1–2 items · inline JSON page 1]
+    ssr -->|"2· GET /variants/sticky<br/>HTTPS · JSON"| ab[ab-decider<br/>assignment before HTML render]
+    ssr -->|"GET /v1/feed<br/>page 1 · 20 entries · HTTPS · JSON"| tla["timeline-api<br/>Case 02: pre-ordered entries<br/>~15 items / page"]
+    u -->|"GET /shell.js<br/>HTTPS · JS"| cdn[/🌍 CDN<br/>content-hashed bundles/]
+    win[winder<br/>viewport window + overscan<br/>scroll anchoring · size cache] -->|"read page:{anchor}"| fs[(feed store<br/>append-only paged log · page 1 inline-seeded<br/>entry_id dedup · stable anchors)]
+    win -->|"scroll position · velocity"| pf[prefetch-manager<br/>predict next page<br/>network / battery gate]
+    pf -->|"GET /v1/feed/next<br/>HTTPS · before:{anchor}"| tla["timeline-api<br/>Case 02: pre-ordered entries<br/>~15 items / page"]
+    pf -->|"append: page N+1 · next cursor token"| fs
+    isl[interaction islands<br/>like · comment · video · registry policy<br/>idle · visible · interaction] -->|"read entries:{entry_id}"| fs
+    isl -->|"POST /v1/like<br/>HTTPS · JSON"| tla
+    isl -->|"write like · comment state (optimistic)"| fs
+    u -->|"tap like · play"| isl
+    u -->|"pull-to-refresh"| ins
+    ins[top-inset-controller<br/>N new posts pill<br/>anchor-safe insertion] -->|"GET /v1/feed/above-top<br/>HTTPS · JSON"| tla
+    ins -->|"insert above-top entries · anchor to first-visible item"| fs
+    tel[telemetry<br/>batched impressions · interactions<br/>flush on visibilitychange] -.->|"POST /beacons<br/>HTTPS · JSON"| rank["ranking-svc<br/>Case 15: ranked stream"]
 ```
 
 ## Components

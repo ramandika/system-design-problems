@@ -11,50 +11,31 @@ holds a lock on "the crawl" globally; everything is per-host or per-shard.
 
 ## 2. Diagram
 
-```
-                  ┌──────────────────────────────────────────────────┐
-                  │                 FRONTIER SCHEDULER               │
-  seeds/sitemaps  │  ┌───────────┐    ┌─────────────┐   ┌─────────┐  │
- ────────────────▶│  │ FRONT     │    │ BACK QUEUES │   │ seen-set│  │
-  discovery feeds │  │ QUEUES    │───▶│ (1+ / host, ├──▶│ (hash   │  │
-  link extraction │  │ (priority │    │  heap by    │   │  dedup) │  │
-        ▲         │  │  tiers)   │    │  next-      │   └─────────┘  │
-        │         │  └───────────┘    │  eligible)  │                │
-        │         └──────────────────┼─────────────┴────────────────┘
-        │                           │  work units (per-host batches)
-        │                           ▼
-        │                  ┌────────────────────┐      ┌────────────┐
-        │                  │  FETCHER FLEET     │◀────▶│ robots.txt │
-        │                  │  (stateless HTTP   │      │  cache     │
-        │                  │   workers + DNS    │      │ (24h TTL,  │
-        │                  │   cache + conn     │      │ per-host)  │
-        │                  │   budget per host) │      └────────────┘
-        │                  └─────────┬──────────┘
-        │                            │ fetched blobs + headers
-        │                            ▼
-        │                  ┌────────────────────┐
-        │                  │  EXTRACTION        │
-        │                  │  charset/html parse│
-        │                  │  boilerplate strip │
-        │                  │  fingerprinting    │
-        │                  │  link extraction   │
-        │                  └─────┬───────┬──────┘
-        │                        │       │
-        │        links (normalize│       │ content records
-        │        + canonicalize) │       │ (text+metadata+signature)
-        └────────────────────────┘       ▼
-                                   ┌──────────────────────┐
-   ┌────────────────┐              │  HANDOFF             │
-   │ URL/content    │◀─────────────│  dedup gate (SimHash │
-   │ TABLE          │  write       │  vs corpus)          │
-   │ (bigtable-style│  status/     └─────────┬────────────┘
-   │  status+fp)    │  sched                 │
-   └────────────────┘                        ▼
-                                    ┌───────────────────┐
-                                    │  STREAM (kafka-   │──▶ indexer
-                                    │  style partitioned│──▶ link-graph builder
-                                    │  at-least-once)   │──▶ freshness scheduler
-                                    └───────────────────┘   (writes back to URL table)
+Q: How does a URL flow from intake through frontier scheduling and the fetcher fleet to extraction, dedup, the stream and back to the URL table?
+
+```mermaid
+flowchart LR
+    src[/seeds · sitemaps · feeds/] -.->|"seed urls<br/>HTTPS · XML"| in[intake<br/>normalize → canonicalize<br/>→ canonical hash]
+    in -->|"GET {hash}"| seen[(🗄️ seen-set<br/>hash-level dedup)]
+    in -.->|"produce: url.discovered"| fr[frontier scheduler<br/>front queues → back queues<br/>sharded by host]
+    fr -->|"PUT {hash}"| seen
+    fr ==>|"gRPC DispatchWorkUnit()"| fe[fetcher fleet<br/>timeouts · size caps · redirect hops<br/>retry-after honored]
+    fe -->|"GET robots.txt"| rb[(robots cache<br/>per-host · 24h TTL)]
+    rb -->|"GET /robots.txt<br/>HTTP · text"| ext[/crawled sites<br/>robots.txt · pages/]
+    fe -->|"GET /{page-url}<br/>HTTP · HTML"| ext
+    fe -.->|"produce: blob.fetched"| ex[extraction<br/>parse → strip → links<br/>→ content record]
+    fe -->|"PUT raw HTML"| bs[(🪣 S3<br/>page blobs · corpus TTL)]
+    ex -->|"GET raw HTML"| bs
+    fe -->|"PUT fetch status"| ut[(🗄️ URL/content table<br/>status · next-attempt<br/>fingerprints)]
+    ex -->|"PUT content record"| ut
+    ex -.->|"produce: link.found"| in
+    ex -.->|"produce: content.record"| dd[dedup gate<br/>SimHash vs corpus<br/>flag near-dups]
+    dd -->|"GET {simhash} k-near"| si[(🗄️ signature index<br/>SimHash corpus · Hamming ≤ k lookup)]
+    dd -.->|"produce: content.record"| st{{📨 stream<br/>partitioned log<br/>at-least-once}}
+    ex -.->|"produce: link.records"| st
+    st -.->|"consume: content · link events"| cons[indexer · link-graph builder<br/>freshness scheduler]
+    cons -->|"SET next-attempt"| ut
+    fr -->|"SCAN next_attempt ≤ now"| ut
 ```
 
 ## 3. Components

@@ -2,55 +2,21 @@
 
 ## Diagram
 
-```
-  3,000 hosts / 10,000 targets
- ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐
- │ node_   │ │ app     │ │ cAdvi-  │ │  black- │        service discovery
- │ exporter│ │ /metrics│ │ sor     │ │  box    │◄────── (deployment system, DNS,
- └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘         cloud APIs → target list)
-      └───────────┴─────┬─────┴───────────┘        short-lived jobs ─► Pushgateway
-                        │  HTTP GET /metrics, gzip, fixed 15 s cadence (PULL)
-                        ▼
-     ┌──────────────────────────────────────────────────────────────────┐
-     │                  PROMETHEUS HA PAIR (identical servers)          │
-     │                                                                  │
-     │   ┌────────────────────────────────────────────────────┐         │
-     │   │ PROM-1                       PROM-2 (mirror)       │         │
-     │   │  scrape manager: 667 scrapes/s, per-target timeout │         │
-     │   │        │ append samples                            │         │
-     │   │        ▼                                           │         │
-     │   │  ┌──────────── head block (in RAM, ~2 h) ────────┐ │         │
-     │   │  │ per-series chunk cache  +  inverted label     │ │         │
-     │   │  │ (memchunks)              index (postings)     │ │         │
-     │   │  └───────┬───────────────────────────▲───────────┘ │         │
-     │   │          │ async flush               │ replay      │         │
-     │   │          ▼                           │             │         │
-     │   │     WAL (append, ~5 B/sample)  ──────┘ on restart   │         │
-     │   │          │                                          │         │
-     │   │          ▼ 2 h block cut (persist mmap'd chunks)    │         │
-     │   │     TSDB BLOCKS on disk: chunks + index postings    │         │
-     │   │     per block + meta.json, immutable                │         │
-     │   │          │                                          │         │
-     │   │     vertical compaction: 2 h ─► 8 h ─► 1 d blocks,  │         │
-     │   │     downsampled; retention deletes old blocks       │         │
-     │   └────────────────────────────────────────────────────┘         │
-     └──────┬──────────────────────────────────┬───────────┬───────────┘
-            │ evaluate alert rules (30 s)      │           │ remote_write sidecar (Thanos /
-            ▼                                  │           ▼ sidecar uploads blocks)
-     ┌──────────────┐   firing alerts          │    ┌──────────────────────────┐
-     │ ALERTMANAGER │◄───(both servers:        │    │ LONG-TERM STORE (object  │
-     │ dedup, group │     duplicate; deduped)  │    │ storage + compactor +    │
-     │ silence,     └────────────────────────────────┤ store gateway,           │
-     │ inhibit, route│                               │ 13 months, downsampled)  │
-     │ → on-call,    │                               └────────────┬─────────────┘
-     │  PagerDuty,   │                                            │ StoreAPI (querier)
-     │  slack, email │                                            ▼
-     └──────────────┘                              ┌──────────────────────────┐
-                                                   │ QUERY LAYER: PromQL      │
-   200 Grafana dashboards ──instant/range QPS─────►│ engine: parse → select   │
-   (Grafana talks to each Prometheus + querier;    │ via label index → fetch  │
-   dashboards pin one server for live data,        │ chunks → eval → aggregate│
-   query federated window when needed)             └──────────────────────────┘
+Q: How do ~267K samples/s get scraped, archived into immutable TSDB blocks, and answered by PromQL queries and 30 s alert rules?
+
+```mermaid
+flowchart LR
+    bj((🧑 batch jobs)) -->|"POST /metrics/job/:job<br/>HTTP · text"| pg[pushgateway<br/>short-lived batch jobs]
+    pr[📈 Prometheus HA pair<br/>service discovery · scrape → head → WAL → 2 h blocks<br/>replica 1 · replica 2] ==>|"1· GET /metrics<br/>HTTP · gzip · 15 s cadence"| ex[node · app exporters<br/>3,000 hosts · /metrics<br/>dumb · no state]
+    pr -->|"GET /metrics<br/>HTTP · text"| pg
+    pr -->|"POST /v2/alerts<br/>HTTPS · JSON"| am[🔔 alertmanager<br/>dedup · group · silence · route<br/>both replicas · duplicate]
+    am -->|"POST firing alerts<br/>HTTPS · JSON"| pd[/🔔 PagerDuty · Slack · email/]
+    pd -->|"notify"| oc((🧑 on-call))
+    pr -->|"2 h blocks<br/>local TSDB dir"| sw
+    sw[store sidecar · gateway<br/>upload blocks · serve old-block reads] -->|"PUT 2 h blocks"| lt[(🪣 long-term store<br/>object storage · compactor<br/>13 months · downsampled)]
+    gr[Grafana<br/>dashboards · 200 boards] -->|"2· POST /api/v1/query_range<br/>HTTP · JSON"| qy[querier · PromQL engine<br/>postings → fetch chunks → eval]
+    qy -->|"gRPC StoreAPI Series()<br/>read head + local blocks"| pr
+    qy -->|"gRPC StoreAPI Series()<br/>old blocks"| sw
 ```
 
 ## Components

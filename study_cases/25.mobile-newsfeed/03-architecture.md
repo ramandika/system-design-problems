@@ -5,45 +5,36 @@
 The client is three engines plus a store, coordinated by a scroll-state-driven controller.
 The server side is a given; only its contract appears here.
 
-```
-                     ┌───────────────────────────────────────────────────┐
-                     │                    THE DEVICE                     │
-                     │                                                   │
- ┌──────────┐        │  ┌──────────────┐     ┌─────────────────────────┐  │
- │  Splash  │──────► │  │ Cold-start   │     │  Feed UI                │  │
- │ contract │        │  │ coordinator  │     │  (RecyclerView /        │  │
- └──────────┘        │  │ (lazy init,  │     │   UICollectionView)     │  │
-                     │  │ restore-UI)  │     └───────────┬─────────────┘  │
-                     │  └──────┬───────┘                 │ scroll events, │
-                     │         │                         │ bind(view,i)   │
-                     │         ▼                         ▼                │
-                     │  ┌─────────────────────────────────────────────┐  │
-                     │  │            FEED CONTROLLER (state machine)  │  │
-                     │  │  window = [cursor, items...]                 │  │
-                     │  │  states: idle / fetching-page / offline      │  │
-                     │  └──┬───────────────┬──────────────┬───────────┘  │
-                     │     │               │              │              │
-                     │     ▼               ▼              ▼              │
-                     │  ┌─────────┐   ┌───────────┐  ┌──────────────┐   │
-                     │  │ Local   │   │  IMAGE    │  │  PREFETCH    │   │
-                     │  │ feed DB │──►│  PIPELINE │◄─│  ENGINE      │   │
-                     │  │ (SQLite │   │ mem LRU → │  │  (gated by   │   │
-                     │  │ /Core   │   │ disk LRU →│  │  Network &   │   │
-                     │  │  Data)  │   │ decode →  │  │  Battery &   │   │
-                     │  │ rows +  │   │ request   │  │  Scroll &    │   │
-                     │  │ cursor  │   │ queue     │  │  Mode)       │   │
-                     │  │ + UI    │   └─────┬─────┘  └──────┬───────┘   │
-                     │  │ state   │         │               │           │
-                     │  └────┬────┘         ▼               ▼           │
-                     │       │        ┌──────────┐   ┌────────────┐     │
-                     └───────┼────────┤   CDN    │   │ /feed API  │─────┼──┐
-                             │        └──────────┘   │ (ranking   │     │  │
-                             │              ▲        │  backend:  │     │  │
-                             └──────────────┼────────┘  GIVEN)    │◄────┼──┘
-                                            │                     │     │
-                                            └── image variants ───┘     │
-                                                                        │
-                          interactions (like/save) ◄── outbox queue ────┘
+Q: How does one scroll-state-driven controller fetch, cache, pre-fetch and render the feed under device constraints?
+
+```mermaid
+flowchart LR
+    subgraph device[the device]
+        co[cold-start coordinator<br/>critical path tiny · rest lazy]
+        fc[feed controller<br/>window · cursor · state machine]
+        ui[feed UI<br/>RecyclerView · UICollectionView]
+        ip[image pipeline<br/>mem LRU → disk LRU → decode]
+        pe[prefetch engine<br/>gated net · battery · scroll]
+        mg[mode governor<br/>one quality tier signal]
+        db[(local feed DB<br/>rows · cursors · position · outbox)]
+    end
+    api[feed API<br/>ranking backend given]
+    cdn[/🌍 CDN<br/>image variants vendor/]
+
+    u((🧑 user)) -->|"open app"| co
+    u((🧑 user)) -->|"scroll"| fc
+    co -->|"read last window · cursor"| db
+    co --> fc
+    fc ==>|"rows · stable IDs"| ui
+    ui -->|"bind request: key (url · target size)"| ip
+    fc -->|"SQL rows · outbox append"| db
+    fc -->|"GET /feed?cursor={opaque}<br/>HTTPS · JSON"| api
+    fc -->|"POST /interactions/batch<br/>HTTPS · JSON"| api
+    fc -->|"scroll position"| pe
+    pe -->|"decode-ahead keys"| ip
+    ip -->|"GET /img/{variant_url}<br/>HTTPS · WebP/HEVC"| cdn
+    mg -->|"quality tier"| ip
+    mg -->|"quality tier"| pe
 ```
 
 ## Components

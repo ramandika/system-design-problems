@@ -2,30 +2,31 @@
 
 ## Diagram
 
-```
-                        ZooKeeper ensemble (one per service cluster)
- ┌────────────────────────────────────────────────────────────────────────┐
- │                                                                        │
- │  ┌────────────┐   ZAB PROPOSE (txn) ──►  ┌───────────┐                │
- │  │  Leader     │────────────────────────►│ Follower 1│──ACK──┐        │
- │  │ (elected,   │◄────────ACK─────────────└───────────┘       │        │
- │  │  epoch N)   │◄────────ACK─────────────┌───────────┐       │        │
- │  │             │────────────────────────►│ Follower 2│──ACK──┤        │
- │  │  COMMIT ◄───┼──── majority of fsync'd ACKs      ────┘        │        │
- │  └────────────┘                                                 │        │
- │        │                                                        │        │
- │        │ COMMIT forwarded to all ──►  Follower 3, Follower 4,   │        │
- │        │                              Observers (apply, no ACK vote)     │
- │   txn log (fsync, quorum barrier) ── periodic snapshots ── cold disk    │
- │   in-memory znode tree (one copy per server, identical after COMMIT)    │
- └────────────────────────────────────────────────────────────────────────┘
-        ▲ reads served HERE (memory), writes forwarded to leader
-        │
- ┌──────┴───────────────────────────────────────────────────────┐
- │ Clients (every server in the coordinated system)             │
- │  session ── ping/timeout ── ephemeral nodes                  │
- │  watch re-arm loop     recipes: election / lock / membership │
- └──────────────────────────────────────────────────────────────┘
+Q: How does a write reach a ZAB quorum, and how do reads, sessions and one-shot watches behave on the servers?
+
+```mermaid
+flowchart LR
+    subgraph zk [ZooKeeper ensemble]
+        l[🗝️ Leader<br/>orders writes via ZAB<br/>epoch N · zxid counter]
+        f[🗝️ Follower<br/>fsync → ACK → apply<br/>serves reads from memory]
+        o[🗝️ Observer<br/>applies commits<br/>serves reads · no vote]
+        tl{{txn log<br/>zxid → mutation<br/>fsync before ACK}}
+        sn[(snapshots<br/>full tree dump<br/>fast restart)]
+    end
+    c((🧑 clients<br/>library · recipes))
+    c -->|"1· write /path<br/>TCP · session"| f
+    c <-->|"TCP session<br/>PING heartbeat"| f
+    f -->|"2· write /path"| l
+    c -->|"read /path<br/>TCP · session"| f
+    c -->|"read /path<br/>TCP · session"| o
+    l ==>|"3· PROPOSAL zxid"| f
+    f -->|"4· fsync proposal"| tl
+    f -->|"ACK zxid"| l
+    l -->|"fsync own log"| tl
+    l -->|"5· COMMIT zxid"| f
+    l -.->|"PROPOSAL · COMMIT zxid"| o
+    f -.->|"watch event · one-shot"| c
+    f -->|"snapshot tree"| sn
 ```
 
 ## Components

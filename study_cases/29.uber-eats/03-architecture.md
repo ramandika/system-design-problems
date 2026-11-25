@@ -2,49 +2,46 @@
 
 ## High-level diagram
 
-```
-                    │                CLIENTS (thin logic, fat surfaces)                │
-                    │   Customer app        Courier app        Restaurant tablet / POS │
-                    └──────┬──────────────────┬───────────────────────┬──────────────────┘
-                           │ HTTPS            │ HTTPS                │ HTTPS
-                           ▼                  ▼                       ▼
-                    ┌─────────────────────────── Edge / API gateway ───────────────────────┐
-                    │  routing + authn  + idempotency keys + rate limits per client class   │
-                    └──────┬──────────────┬────────────────┬───────────────────────┬────────┘
-                           │              │                │                       │
-              ┌────────────▼───┐  ┌───────▼───────┐  ┌─────▼──────────┐   ┌────────▼─────────┐
-              │ CATALOG SVC    │  │ ORDER SVC     │  │ DISPATCH SVC    │   │ TRACKING SVC     │
-              │ - menus, mods  │  │ - order state │  │ - supply index  │   │ - ws fanout,     │
-              │ - publish ver. │  │   machine     │  │   (geo index)   │   │   latest-wins    │
-              │ - stock-outs   │  │   (owner)     │  │ - assignment    │   │ - per-order room │
-              └───┬────────┬───┘  └──┬────┬───────┘  │   engine + ETA  │   │   multiplexer    │
-                  │        │         │    │          └───┬─────────┬───┘   └───────┬──────────┘
-                  │        │         │    │              │         │               │
-        ┌─────────▼──┐  ┌──▼─────────▼─┐  │       ┌──────▼─────┐ ┌─▼───────────────▼─┐
-        │ CDN        │  │ EVENT BUS    │◄─┼───────┤ ETA SVC    │ │ LOCATION PIPELINE │
-        │ (menus,    │  │ ( Kafka )    │  │       │ (prep time │ │ ping ingest →     │
-        │  photos)   │  │              │  │       │ + travel)  │ │ downsample →      │
-        └────────────┘  │  topics:     │  │       └─────┬──────┘ │ geo-partitioned   │
-                        │  orders.*,   │  │             │        │ live supply store │
-                        │  dispatch.*, │  │             │        │ (in-mem + Redis)  │
-                        │  location.*, │  │             │        └─────────┬─────────┘
-                        │  payments.*  │  │             │                  │
-                        └──┬────┬────┬──┘  │             │                  │
-                           │    │    │     │             │                  │
-              ┌────────────▼┐ ┌─▼─────────▼─┐   │      ┌──────▼────────┐ ┌───────▼────────┐
-              │ SETTLEMENT  │ │ NOTIFICATION │   │      │ MERCHANT OPS  │ │ SUPPORT/RISK   │
-              │ LEDGER      │ │ & PUSH       │   │      │ (analytics,   │ │ (reconciliation│
-              │ (immutable) │ │ (state→client│   │      │ prep reports) │ │  alerts, fraud)│
-              └─────────────┘ └──────────────┘   │      └───────────────┘ └────────────────┘
-                                                 │
-                                        ┌────────▼─────────┐
-                                        │ BLOB STORE       │
-                                        │ (photos, docs)   │
-                                        └──────────────────┘
+Q: How does an order flow from checkout through dispatch and live tracking to asynchronous settlement?
+
+```mermaid
+flowchart LR
+    c((🧑 customer)) ==>|"1· POST /orders<br/>HTTPS · JSON · idempotency key"| gw["edge gateway<br/>authn · idempotency · rate limits"]
+    me((🧑 merchant tablet)) -->|"3· POST /orders/{id}/accept<br/>HTTPS · JSON"| gw
+    cu((🧑 courier)) -->|"POST /location/pings<br/>HTTPS · JSON"| gw
+    gw -->|"2· gRPC CreateOrder()<br/>proto"| os["order svc<br/>state machine · price snapshot"]
+    gw -->|"4· gRPC ApplyTransition(order_id, from, to)<br/>proto"| os
+    os -->|"🐘 SQL upsert order:{id} transitions"| odb[(🐘 orders db<br/>sharded by order id · append-only transition events)]
+    os -->|"POST /payments/authorize<br/>HTTPS · JSON"| psp[/"payment PSP"/]
+    os -.->|"produce: orders.created · orders.accepted"| ob{{"📨 event bus<br/>orders.* · dispatch.*<br/>location.* · payments.* · eta.*"}}
+    gw -->|"GET /menus/{id}<br/>HTTPS · JSON · CDN-first"| cdn[/"🌍 CDN<br/>menus · photos"/]
+    cdn -->|"GET /menus/{id}<br/>HTTPS · JSON"| cat["catalog svc<br/>versioned menu snapshots"]
+    cat -->|"PURGE /menus/{id}<br/>HTTPS"| cdn
+    ob -.->|"consume: orders.accepted"| ds["dispatch svc<br/>candidates → score → assign"]
+    ds -->|"geo query couriers near:{cell}"| sup[("live supply store<br/>geo-sharded · in-mem + ⚡ Redis mirror")]
+    ds -->|"gRPC GetEta()<br/>proto"| eta["ETA svc<br/>kitchen behavior + road graph"]
+    eta -.->|"produce: eta.updated"| ob
+    ob -.->|"consume: orders.* · location.pos"| eta
+    ds -.->|"produce: dispatch.assigned"| ob
+    ob -.->|"consume: dispatch.*"| os
+    cu -->|"6· POST /offers/{id}/decide<br/>HTTPS · JSON"| gw
+    gw -->|"gRPC SubmitOfferDecision()<br/>proto"| ds
+    gw -->|"POST /location/pings<br/>HTTPS · JSON"| lp["location pipeline<br/>ingest → downsample"]
+    lp -->|"upsert courier:{id}"| sup[("live supply store<br/>geo-sharded · in-mem + ⚡ Redis mirror")]
+    lp -.->|"produce: location.pos"| ob
+    ob -.->|"consume: orders.* · eta.updated"| tr["tracking svc<br/>per-order rooms · latest-wins"]
+    ob -.->|"consume: location.pos"| tr
+    tr <-->|"WS state deltas<br/>wss · JSON"| c
+    tr <-->|"WS pos + ETA bands<br/>wss · JSON"| cu
+    me <-->|"WS order events<br/>wss · JSON"| tr
+    ob -.->|"consume: orders.*"| notif["🔔 notification svc<br/>merchant + customer push"]
+    notif -->|"push: order.accepted"| me
+    ob -.->|"consume: orders.*"| mo["merchant ops + risk<br/>prep queues · reconciliation · fraud"]
+    ob -.->|"consume: orders.delivered"| led[("settlement ledger<br/>immutable rows")]
 ```
 
-(ASCII; arrows show dominant call direction. The event bus is drawn once for clarity —
-every service both publishes to and consumes from it.)
+(The event bus is drawn once for clarity — every service both publishes to and consumes
+from it.)
 
 ## Components
 

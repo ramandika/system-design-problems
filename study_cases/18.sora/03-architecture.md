@@ -2,53 +2,31 @@
 
 ## High-level diagram
 
-```
-                        +-------------------+
-   Client (web/app) --> | API edge / auth    |  rate limits priced in GPU-minutes
-                        +---------+---------+
-                                  |
-                        +---------v---------+
-                        | Prompt intake      |  text-level safety pre-check,
-                        | + request shaping  |  size/duration/quality params,
-                        +---------+---------+  dedupe cache (prompt-hash)
-                                  |
-                        +---------v---------+
-                        | Job orchestrator   |  job DAG, priorities, budgets,
-                        | (queue + state DB) |  per-user credits, ETA estimate
-                        +---------+---------+
-                                  |
-              +-------------------+--------------------+
-              |                   |                    |
-    +---------v--------+ +--------v---------+  +-------v--------+
-    | Draft scheduler   | | Main GPU fleet    |  | Post scheduler  |
-    | (cheap preview    | | (H100-class,      |  | (upscale/encode |
-    |  passes, coarse   | |  chunked latent   |  |  renditions)    |
-    |  fast-fail)       | |  pipeline)        |  +-----------------+
-    +-------------------+ +--+-------------+--+
-                             |             |
-                  +----------v----+   +----v-----------+
-                  | Checkpoint &   |   | Assembly worker |
-                  | artifact store |   | (stitch chunks, |
-                  | (object store) |   |  encode, mux)   |
-                  +----------------+   +--------+--------+
-                                                |
-                                     +----------v-----------+
-                                     | Screening service     |
-                                     | (classifiers on final |
-                                     |  artifact + latents;  |
-                                     |  human review queue)  |
-                                     +----------+-----------+
-                                                |
-                                     +----------v-----------+
-                                     | Publish + watermark    |
-                                     | (C2PA metadata, hash)  |
-                                     +----------+-----------+
-                                                |
-                          +---------------------v----------------------+
-                          | Metadata DB      | CDN (renditions,        |
-                          | (jobs, assets,   |  watermarked artifacts) |
-                          | verdicts, TTLs)  |  --> clients, feed      |
-                          +------------------+-------------------------+
+Q: How does one generation flow through the job DAG — prompt intake, chunked GPU work, screening, and publish — without a job ever escaping unscreened?
+
+```mermaid
+flowchart LR
+    u((🧑 client)) ==>|"POST /generations<br/>HTTPS · JSON"| edge[api-edge<br/>auth · GPU-minute budgets<br/>queue/ETA surface]
+    edge -->|"POST /intake<br/>HTTPS · JSON (prompt + params)"| pin[prompt-intake<br/>text safety classifiers<br/>prompt-hash dedupe]
+    pin -->|"POST /v1/jobs<br/>HTTPS · JSON (validatable params)"| jo[job-orchestrator<br/>job DAG · priorities · budgets<br/>checkpoints · credits]
+    jo -->|"upsert jobs · credits"| mdb[(metadata DB<br/>jobs · assets · verdicts<br/>credit balances)]
+    pin -->|"GET (prompt-hash, params)"| mdb
+    edge -->|"cancel: job_id"| jo
+    dp[draft-gpu-fleet<br/>low-res early preview pass] -->|"gRPC LeaseDraftJob()<br/>pull draft job"| jo
+    dp -.->|"draft preview 15s<br/>HTTPS · JSON"| edge
+    dp -.->|"draft preview frames"| srv
+    mf[main-gpu-fleet<br/>chunked latent generation] -->|"gRPC LeaseChunkJob()<br/>pull (job_id, chunk_idx)"| jo
+    mf -->|"checkpoint latents + keyframes"| ar[(🪣 artifact store<br/>latents · renditions<br/>content-addressed · TTL)]
+    mf -->|"GET boundary latents"| ar
+    pp[post-assembly<br/>stitch → upscale → encode renditions] -->|"gRPC LeaseAssembleJob()<br/>pull assemble job"| jo
+    pp -->|"read latents · write renditions"| ar
+    pp -->|"SQL artifacts · job=assembled"| mdb
+    pp -->|"POST /screen<br/>HTTPS · JSON (artifact id)"| srv[screening-svc<br/>artifact + latent classifiers<br/>human review queue]
+    srv -->|"write verdict"| mdb
+    srv -->|"POST /publish<br/>HTTPS · JSON (artifact id, verdict=clear)"| pub[publish-and-watermark<br/>watermark embed · C2PA manifest]
+    pub -->|"GET renditions"| ar
+    pub -->|"PUT renditions<br/>HTTPS · H.264/AV1"| cdn[/🌍 CDN/]
+    pub -.->|"notify: clip ready (artifact id)"| u
 ```
 
 ## Components
@@ -86,8 +64,9 @@
 
 **Generate (happy path)**, timeline for a 10s clip:
 
-1. POST /generations → intake validates, dedupe-misses, writes the job, charges the
-   user's credits, returns job id ~instantly.
+1. POST /generations → intake validates, dedupe-misses, hands the job to the
+   orchestrator, which writes the job record, charges the user's credits, and returns a
+   job id ~instantly.
 2. Draft pass on the draft pool (~15–30s): either the user sees an early preview and can
    cancel/adjust (saves a full job when the prompt was dud — ~1/3 of jobs by assumption),
    or it's skipped for one-tap simple prompts.

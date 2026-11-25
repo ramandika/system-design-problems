@@ -2,32 +2,23 @@
 
 ## Diagram
 
-```
-                    ┌────────────────────────── CLIENTS ──────────────────────────┐
-                    │  WebRTC-style endpoint: capture, encode x3 layers (video),  │
-                    │  Opus (audio), bandwidth estimator, jitter buffer, decrypt  │
-                    └──────┬───────────────────────────────┬──────────────────────┘
-                           │ HTTPS/QUIC (signaling)        │ SRTP/UDP (media)
-                           ▼                               ▼
-              ┌─────────────────────────┐      ┌──────────────────────────┐
-              │ SIGNALING / MEETING SVC │      │  MEDIA RELAY FLEET (SFU) │
-              │  meeting state machine  │─────►│  per-meeting: 1 relay    │
-              │  join/leave, mute mode  │assign│  (big meetings: 1+ sharded)
-              │  roster, permissions    │relay │  forward-only, per-sub   │
-              └───────┬─────────────────┘      │  layer selection         │
-                      │                        └────────────┬─────────────┘
-                      ▼                                     │ recording tap
-        ┌──────────────────────┐                            ▼
-        │ TURN/relay fallback  │                  ┌────────────────────┐
-        │ (symmetric NAT path) │                  │ RECORDING PIPELINE │
-        └──────────────────────┘                  │ composite → blob   │
-                                                  └────────────────────┘
-              ┌────────────────────────── CONTROL PLANE ─────────────────────┐
-              │  meeting service (SQL): meetings, roster, admission          │
-              │  relay allocator: picks SFU near sender, cap per node        │
-              │  edge POPs: media nodes per region, anycast entry            │
-              │  notification svc: invites, "meeting starting" push          │
-              └──────────────────────────────────────────────────────────────┘
+Q: How do clients establish the media plane — signaling, relay assignment, SFU media sessions, TURN fallback and recording?
+
+```mermaid
+flowchart LR
+    u((🧑 participants<br/>3 video layers · Opus<br/>content track · bandwidth estimator)) ==>|"1· POST /join<br/>HTTPS · JSON · join/mute/roster"| sg[signaling · meeting svc<br/>meeting state machine]
+    sg -->|"2· pickSFU()<br/>gRPC · proto"| ra[relay allocator<br/>region + capacity<br/>failover reassignment]
+    ra -->|"3· gRPC AssignRelay()"| sfu[SFU fleet at edge POPs<br/>primary media path<br/>forward-only · per-sub layer pick]
+    u <-->|"SRTP media session<br/>subscribe · layer per receiver<br/>content track priority"| sfu
+    u <-->|"SRTP · symmetric NAT"| tn[TURN fallback<br/>relay when UDP blocked]
+    tn <-->|"SRTP media"| sfu
+    sg -->|"SQL meetings · roster · admission"| db[(🐘 Postgres<br/>meetings · roster)]
+    sfu -->|"tapped streams · RTP"| rec[recording pipeline<br/>composite → encode]
+    rec -->|"recording objects"| s3[(🪣 blob store<br/>~100 TB per day)]
+    sg -.->|"push: roster update<br/>HTTPS · JSON"| u
+    sg -.->|"produce: meeting.events"| k{{📨 Kafka<br/>meeting events}}
+    k -.->|"consume: meeting.events"| nt[🔔 notification svc<br/>meeting.events → push]
+    nt -->|"push: meeting.notify<br/>APNs · FCM"| inv((🧑 invited users))
 ```
 
 ## Components
@@ -57,6 +48,28 @@ receivers with zero server-side re-encoding.
 **Reconnect** (deep dives §5): client notices dead path → signaling session still valid
 server-side → new ICE to the same relay (or reassignment) → keyframe request to resume video
 → roster/controls re-sync → media flows again, no "rejoin the meeting" needed.
+
+Q: After a dead media path, can the client resume without rejoining the meeting?
+
+```mermaid
+sequenceDiagram
+    actor c as client
+    participant sg as signaling · meeting svc
+    participant sfu as SFU
+    note over c,sfu: ICE dead path detected
+    c->>sg: reconnect · session resume
+    alt signaling session valid · same relay
+        sg-->>c: resume at same SFU
+    else failover reassignment
+        sg-->>c: new SFU address · token
+    end
+    c->>sfu: new ICE · DTLS · SRTP handshake
+    c->>sfu: re-subscribe layers · PLI keyframe
+    sfu-->>c: keyframe
+    c->>sg: get full state · session token
+    sg-->>c: roster · controls re-sync
+    sfu-->>c: SRTP media resumes · keyframes
+```
 
 **Recording**: relay taps selected streams → composite transcoder (offline farm) → object
 storage + chat/annotation merge → availability to the host minutes-to-hours later, never on

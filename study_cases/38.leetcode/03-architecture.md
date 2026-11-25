@@ -6,23 +6,25 @@ queue and the result stream — nothing else reaches into the judge fleet.
 
 ## Diagram
 
+Q: How does a submission become a verdict on the user's stream, and who consumes the verdict log?
+
 ```mermaid
 flowchart LR
-  W[Web and mobile clients] <-->|SSE verdicts, ranks| DLQ[Delivery gateways, SSE or WS hubs]
-  DLQ -->|verdict and rank events| GW[Edge gateway + auth]
-  W -->|submit source| GW
-  GW --> API[Submission API, problem catalog]
-  API --- PG[(SQL: users, problems, submission history)]
-  API -->|enqueue, per-language, prioritized| Q[Submission queue]
-  Q -->|dequeue| JF[Judge workers, one per language]
-  POOL[Warm sandbox pools, per language image] -->|pre-booted sandboxes| JF
-  JF --> COMP[[Compile step, sandboxed]]
-  COMP --> SBX[[Sandbox: untrusted run, gVisor or microVM or nsjail]]
-  TC[Hidden test case store] -->|read-only mount, one case at a time| SBX
-  JF -->|verdicts| JD[(Verdict log, partitioned event stream)]
-  JD -->|consume| LB[Contest leaderboard service, exact per-contest counters]
-  JD -->|consume| AC[Anti-cheat pipeline, similarity + ghost signals]
-  LB -->|subscribe submission-id, ranks| DLQ
+  u((🧑 users<br/>submit · watch)) ==>|"POST /submissions<br/>HTTPS · JSON"| api[submission-api<br/>validate · durable row · enqueue]
+  u -->|"GET /submissions/{sid}/stream<br/>HTTPS · SSE"| hub[delivery hub<br/>SSE/WS sessions per submission]
+  api -->|"SQL submissions"| pg[(🐘 Postgres<br/>users · problems · submissions)]
+  api -.->|"produce: judge.job"| q{{📨 judge queue<br/>per-language · priority lanes}}
+  q -.->|"consume: judge.job"| jf[judge worker<br/>pull → compile → run]
+  pool[warm pool<br/>pre-booted sandboxes · per-language image] -->|"booted sandbox"| jf
+  jf --> comp[[sandboxed compile<br/>fixed wall-clock budget]]
+  comp -->|"binary"| sbx[[untrusted run<br/>gVisor · nsjail · microVM]]
+  sbx -->|"mount 1 case"| tc[(test-case store<br/>hidden tests · read-only)]
+  jf -.->|"produce: verdict"| jd{{📨 verdict log<br/>partitioned event stream}}
+  jd -.->|"consume: verdict"| lb[leaderboard<br/>exact per-contest counters]
+  jd -.->|"consume: verdict"| ac[anti-cheat<br/>similarity · ghost signals]
+  jd -.->|"consume: verdict"| hub
+  jd -.->|"consume: verdict"| api
+  lb -->|"gRPC PushDeltas()"| hub
 ```
 
 (ASCII sketch of the judge sandbox, the security-critical box:)

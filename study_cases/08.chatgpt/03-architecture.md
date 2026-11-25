@@ -55,25 +55,27 @@
                     └─────────────────────────────┘
 ```
 
-The same picture in Mermaid:
+Q: What happens to one user turn, from the persistent connection to the token stream back?
 
 ```mermaid
 flowchart LR
-  C[Clients web/app] -->|SSE/WebSocket| GW[Edge gateway tier]
-  GW --> CS[Conversation service]
-  CS --> DS[(Conversation store)]
-  CS --> RL[Admission + per-tier rate limits]
-  RL --> MOD[Inline moderation classifier]
-  MOD --> SCH[Inference scheduler]
-  REG[Model registry + canary router] -->|version pin| SCH
-  SCH --> PF[Prefill pool]
-  SCH --> DC[Decode pool]
-  PF -->|KV| DC
-  PF -.-> PC[(Prompt/prefix cache)]
-  DC -.-> PC
-  DC -->|token stream| SA[Stream assembly + completion persist]
-  SA -->|tokens| GW
-  SA -->|completed turns| AM[Async moderation, abuse, billing]
+  c((🧑 clients<br/>web · app)) <-->|"1· user turn · SSE token stream<br/>SSE/WS · JSON"| gw[Edge gateway tier<br/>auth · TLS · conn bookkeeping]
+  gw -->|"2· gRPC AppendTurn()<br/>turn text · conv id"| cs[Conversation service<br/>stored turns → context window · prefix id]
+  cs -->|"KV get+put turns"| ds[(Conversation store<br/>durable turns)]
+  cs -->|"3· gRPC SubmitTurn()<br/>tokens · prefix id"| rl[Admission + rate limits<br/>token quotas · shed free tier]
+  rl -->|"gRPC ScreenPrompt()<br/>prompt tokens · tier"| mod[Inline moderation<br/>fast classifier gate]
+  mod -->|"4· gRPC EnqueuePrompt()<br/>prompt"| sch[Inference scheduler<br/>affinity routing · batching · preemption]
+  sch -->|"gRPC GetVersionMap()"| reg[Model registry + canary router<br/>version → routing pct]
+  sch -->|"gRPC Prefill()<br/>prompt · prefix id"| pf["Prefill pool<br/>compute-bound: prompt → KV"]
+  sch -->|"gRPC Decode()<br/>request · prefix id"| dc[Decode pool<br/>memory-bound · continuous batching]
+  pf -->|"gRPC KV-transfer()<br/>cache miss · full prefill"| dc
+  pc[("Prompt/prefix cache<br/>hot KV of shared prefixes · affinity-held on GPUs")]
+  pf <-->|"KV in/out · prefix id"| pc
+  dc <-->|"KV page residency"| pc
+  dc -->|"gRPC StreamTokens()<br/>token deltas · proto"| sa[Stream assembly + persistence<br/>tokens → gateway · write final turn]
+  sa -->|"token deltas<br/>gRPC stream · proto"| gw
+  sa -.->|"KV put turn · conv id"| ds
+  sa -.->|"completed turns (async)"| am[Async moderation<br/>abuse patterns · billing]
 ```
 
 ## Components

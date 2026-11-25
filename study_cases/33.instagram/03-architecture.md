@@ -49,30 +49,53 @@
    +---------------------------------------+  event bus -> feature store
 ```
 
-*(Mermaid equivalent of the same topology:)*
+*Q: What are the deploy units of Instagram, and what crosses between them on post and on feed read?*
 
 ```mermaid
 flowchart LR
-  C[Mobile client] --> GW[API gateway]
-  GW --> ING[Media ingest]
-  ING --> BLOB[Blob store: original]
-  BLOB --> XCODE[Transcode pipeline]
-  XCODE --> META[Media metadata DB]
-  XCODE --> BLOB2[Blob store: renditions]
-  XCODE --> EV[Event bus]
-  EV --> POOL[Feed pool cache]
-  ENG[Engage svc] --> EV
-  EV --> FEAT[Feature store]
-  FEAT --> RANK[Ranker]
-  FEED[Feed API] --> POOL
-  FEED --> RANK
-  STORY[Story svc: TTL, seen state] --> FEED
-  EXP[Explore/Reels svc] --> FEED
-  CDN[CDN edge] --> BLOB2
-  C --> CDN
-  C --> FEED
-  C --> STORY
-  C --> ENG
+    c(("🧑 user<br/>mobile client<br/>capture · ABR playback · offline queue"))
+    ing["media ingest<br/>validate → PENDING row → ack"]
+    orig[("🪣 blob store<br/>originals<br/>immutable keys")]
+    xc["transcode pipeline<br/>original → renditions<br/>retriable workers"]
+    meta[("🐘 media metadata DB<br/>post/story rows · state<br/>sharded by author ID")]
+    rend[("🪣 blob store<br/>renditions<br/>content-addressed")]
+    ev{{"📨 Kafka<br/>post · story · engage · view events"}}
+    pool[("⚡ feed pool cache<br/>per-user candidate pools<br/>IDs + scores, no bytes")]
+    eng["engage svc<br/>like · comment · save · counters"]
+    feat[("🗄️ feature store<br/>engagement features<br/>fresh signals")]
+    rank["ranker<br/>candidate scoring"]
+    feed["feed-api<br/>merge pools · celebrity on-read → rank → screenful"]
+    stor["story svc<br/>tray · 24h TTL · seen state"]
+    exp["explore/reels svc<br/>candidate gen from global graph"]
+    cdn[/"🌍 CDN<br/>origin shield · edge<br/>~90%+ hit rate"/]
+
+    c ==>|"1· POST /v1/media originals<br/>HTTPS · JPEG/HEIC"| ing
+    ing -->|"PUT original · key: content hash"| orig
+    ing -->|"SQL INSERT post row<br/>state = PENDING"| meta
+    ing -.->|"produce: story.created"| ev
+    ing -.->|"produce: object.ready"| ev
+    ev -.->|"consume: object.ready"| xc
+    orig -->|"GET original · immutable key"| xc
+    xc -->|"SQL UPDATE post row<br/>state → SERVING"| meta
+    xc -->|"PUT renditions<br/>content-addressed keys"| rend
+    xc -.->|"produce: media.serving"| ev
+    ev -.->|"consume: media.serving"| pool
+    eng -.->|"produce: engage.events"| ev
+    ev -.->|"consume: engage.events"| feat
+    ev -.->|"consume: engage.events · graph signals"| exp
+    rank -->|"GET features · candidate key"| feat
+    feed -->|"MGET pool:uid"| pool
+    feed -->|"GET celebrity recent-posts index"| meta
+    feed -->|"gRPC Rank()<br/>proto"| rank
+    feed -->|"GET /v1/candidates<br/>HTTPS · JSON"| exp
+    cdn -->|"origin fetch · GET rendition<br/>HTTPS · immutable key"| rend
+    c -->|"2· GET /v1/feed<br/>HTTPS · JSON"| feed
+    c -->|"3· GET /v1/story/tray<br/>HTTPS · JSON"| stor
+    ev -.->|"consume: story.created"| stor
+    stor -.->|"produce: story.seen"| ev
+    c -->|"4· POST /v1/engage<br/>HTTPS · JSON"| eng
+    c -.->|"POST /v1/story/view<br/>HTTPS · JSON<br/>seen mark"| stor
+    c -->|"2· GET /{rendition-key}<br/>HTTPS · bytes"| cdn
 ```
 
 ## Components

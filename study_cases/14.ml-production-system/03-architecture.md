@@ -2,38 +2,38 @@
 
 ## Diagram
 
-```
-  PRODUCT DATA                     FEATURE PLATFORM                     TRAINING
-  ────────────                     ────────────────                     ────────
-  Event stream ──► Kafka ──────────►┌──────────────────────┐
-  (actions,        │               │  Feature store       │      Labeled windows
-  raw context)     │   streaming   │  ONLINE (KV cluster) │◄─────── daily batch
-                   └──────────────►│  OFFLINE (parquet +  │        (Spark)
-  OLAP warehouse ─────────────────►│   stream-aggregates) │  ┌──────────────┐
-  (daily batch tables)            └┴──────────┬───────────┘  │ Training set  │
-                                               │              │ builder       │
-                        get_features           │              │ (point-in-time│
-                                               │              │  join, Spark) │
-  SERVING                                       ▼              └──────┬───────
-  ───────                                                logged      │
-  request ─► Feature service ─► Model server ────scores──►features────┤
-             (fetch, cache)     (in-process,      model version,          │
-                                 N versions       raw inputs              ▼
-                                 hot-swapped)                          Prediction log →
-                                  │      ▲                          Kafka → compaction
-                     load artifact│      │ (champion/challenger     → offline store
-                     v            │      │  split; shadow path)          │
-               ┌──────────────────┴──────┴───────┐                       │
-               │  Model registry (DB + artifact  │   eval receipts,      │
-               │  store) — versions immutable,   │◄── approval gates ────┤
-               │  promotion = pointer move       │   (offline eval on    │
-               └─────────────────────────────────┘    held-out window)   │
-                          │                                               │
-                          ▼                                               ▼
-  ┌─────────────────────────────────────────────────────────────────────────────┐
-  │  MONITORING: distribution drift (PSI/KS) on logged inputs & scores,         │
-  │  serving SLOs, per-model metrics → alerts → retrain triggers / page         │
-  └─────────────────────────────────────────────────────────────────────────────┘
+Q: How does the serving hot path fetch features and score in-process, and how do logs close the training, promotion and monitoring loop?
+
+```mermaid
+flowchart LR
+    u((🧑 client<br/>user_id · context))
+    s[rank serving binary<br/>resolve feature list -> MGET -> Score<br/>N versions in-process · champion · challenger · shadow]
+    o[(feature store ONLINE<br/>KV cluster<br/>p99 under 2 ms)]
+    plog{{📨 prediction log<br/>what was served<br/>one schema}}
+    ev{{📨 event log<br/>actions · raw context}}
+    olap[(OLAP warehouse<br/>daily batch tables)]
+    offl[(feature store OFFLINE<br/>parquet · point-in-time<br/>stream aggregates)]
+    bud[training-set builder · trainer<br/>point-in-time join → offline eval<br/>vN artifact]
+    reg[(model registry<br/>immutable versions<br/>promotion = pointer move)]
+    art[(🪣 artifact store<br/>content-addressed versions<br/>~1 TB / 1000 versions)]
+    p((🧑 on-call))
+    mon[monitoring<br/>PSI/KS drift · SLOs<br/>retrain trigger / page]
+    u ==>|"1· POST /rank<br/>HTTPS · JSON"| s
+    s -->|"2· MGET feature keys"| o
+    s -.->|"produce: prediction<br/>scores · inputs · model version"| plog
+    s -->|"SQL production pointer"| reg
+    ev -.->|"consume: events"| offl
+    ev -.->|"consume: feature updates"| o
+    olap -.->|"SQL daily batch tables"| offl
+    ev -.->|"consume: labels"| bud
+    bud -->|"SQL training partitions · point-in-time"| offl
+    bud -->|"SQL snapshot features · as-of event time"| offl
+    plog -.->|"consume: logged features"| bud
+    bud -->|"put vN + eval receipts"| reg
+    art -.->|"pull vN · verify · load"| s
+    plog -.->|"consume: scores · inputs"| mon
+    mon -.->|"retrain.trigger (Tier 2) · drifted-feature evidence"| bud
+    mon -.->|"page (Tier 1/3)"| p
 ```
 
 ## Components
@@ -64,7 +64,8 @@ separate "inference service" hop (trade-off in deep dive 4).
 **Training (cold path)**: nightly labeled partitions exist (day-2 complete) → builder
 joins labels against **logged served features first**, snapshot features only for fields the
 logs lack → partitioned parquet → training reads, produces a version → offline eval on a
-held-out window → registry `candidate`.
+held-out window → registry `candidate`. The warehouse's daily batch tables feed the offline
+store's batch side (deep dive 2), alongside the log-derived stream aggregates.
 
 **Promotion (registry workflow)**: candidate → shadow (mirror live traffic, compare score
 distributions + offline-eval receipts) → partial (e.g. 5% real traffic behind an experiment

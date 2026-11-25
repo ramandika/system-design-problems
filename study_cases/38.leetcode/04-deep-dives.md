@@ -58,6 +58,47 @@ and *never* trusted from the client:
   per-language limits, not a global default — get this wrong and every "legitimate"
   submission in that language TLEs.
 
+The full interaction, traced against those failure modes (the delivery-side fallbacks are
+deep dive 3):
+
+Q: Between submit and the verdict on the user's screen — if the run TLEs or the sandbox crashes mid-run, what does the user see, and how does the verdict log still end up with a terminal verdict?
+
+```mermaid
+sequenceDiagram
+    actor u as 🧑 user
+    participant api as submission-api<br/>validate · durable row · read model
+    participant q as 📨 judge queue<br/>per-language · priority lanes
+    participant jw as judge worker<br/>pull → compile → sandbox run
+    participant vl as 📨 verdict log<br/>append-only events
+    participant hub as delivery hub<br/>SSE per submission
+
+    u->>api: 1· POST /submissions {source}
+    api->>api: 2· SQL submissions row (queued)
+    api->>q: 3· produce: judge.job {id, limits}
+    api-->>u: 202 accepted {submission_id}
+    q-)jw: 4· consume: judge.job (worker pull)
+    alt run fits limits
+        jw->>jw: compile + N sandbox case runs
+    else wall/CPU cap fires (TLE)
+        jw->>jw: supervisor kills run from outside — verdict TLE, run billed to user quota
+    else sandbox crashes mid-run
+        jw->>jw: destroy contaminated sandbox, re-run once on a fresh one, drop host from rotation
+    end
+    jw-)vl: 5· produce: verdict {verdict, cpu_ms, per-case events} — terminal state always appended
+    vl-)hub: 6· consume: verdict
+    vl-)api: 7· consume: verdict (project into submission row)
+    hub-)u: 8· SSE verdict event {verdict, cpu_ms}
+    opt hub drops event / SSE dead (heartbeat miss)
+        u->>api: 9· GET /submissions/{id} (fallback poll)
+        api-->>u: 10· submission row — verdict, idempotent
+    end
+```
+
+The point of the `alt`: every branch — the normal run, the supervisor-imposed TLE, even a
+crashed sandbox and its one re-run — converges on the same step 5, so the log is the one
+place that always holds a final state per submission; the judge never talks to the client
+and the API never polls the judge (both sides only meet at the queue and the log).
+
 ## 2. Warm pools, per-language images, and judge-worker queueing
 
 Judge throughput is a queueing problem, not a compute problem. Cold paths: pulling a

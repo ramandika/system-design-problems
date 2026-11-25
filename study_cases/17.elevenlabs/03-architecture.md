@@ -2,45 +2,30 @@
 
 ## Diagram
 
-```
-      INTERACTIVE PATH (latency-SLO)                BATCH PATH (throughput-SLO)
- ┌──────────────────────────────┐           ┌───────────────────────────────────┐
- │  voice agent / playground UI │           │  long doc / dubbing job submit    │
- │        (WebSocket)           │           │        (HTTPS + webhook)          │
- └──────┬───────────────────────┘           └──────┬────────────────────────────┘
-        │text deltas                 audio chunks  │ job
-        ▼                              ▲          ▼
- ┌──────────────┐  ┌───────────────────┴───┐  ┌───────────────┐
- │  Edge GW /   │  │ Streaming Synth Ctrl  │  │ Job queue     │
- │  WS gateway  │◄─┤ (per-stream: segmenter│  │ (durable)     │
- └──────────────┘  │  -> inference broker) │  └──────┬────────┘
-                   └───────────┬───────────┘         │ segment jobs
-                               ◄─ infer req ─────┐   ▼
-                   ┌─────────────────────────────┴─────────┐
-                   │   GPU inference pool                  │
-                   │  ┌─────────────────┐ ┌──────────────┐ │
-                   │  │ interactive     │ │ batch pool   │ │  ← same HW,
-                   │  │ pool (sticky,   │ │ (preemptible │ │   separate
-                   │  │ preemption-proof│ │  queue)      │ │   schedulers
-                   │  └─────────────────┘ └──────────────┘ │
-                   │  per-GPU: voice-model cache (LRU)     │
-                   └──────────┬────────────────────────────┘
-                              │ voice lookup / authorization /
-                              │ weights load
-              ┌───────────────┼──────────────────────────┐
-              ▼               ▼                          ▼
-      ┌──────────────┐ ┌─────────────┐        ┌──────────────────────┐
-      │ Voice        │ │ Consent &   │        │ Object store (WAV/   │
-      │ registry DB  │ │ abuse svc   │        │ MP3) + CDN + webhook │
-      │ (voices,     │ │ (refusal,   │        │ svc for batch output │
-      │ ownership)   │ │ watermark)  │        └──────────────────────┘
-      └──────────────┘ └─────────────┘
-              ▲
-      ┌───────┴────────┐   ┌───────────────────────────┐
-      │ Voice asset    │   │ Metering svc (char credit │
-      │ store: refs +  │   │ aggregation -> billing)   │
-      │ clone weights  │   └───────────────────────────┘
-      └────────────────┘
+Q: How do interactive streaming and batch synthesis share one GPU fleet — and what does every synthesis check before it spends GPU-seconds?
+
+```mermaid
+flowchart LR
+    u((🧑 client)) <-->|"WS /v1/tts<br/>wss · JSON → PCM"| wsg[ws-gateway<br/>auth · per-tenant routing]
+    wsg -->|"gRPC DeliverDelta()<br/>text deltas · proto"| sc[stream-controller<br/>text deltas → sentence segments<br/>sequence · backpressure · cancel]
+    sc -->|"SQL consent · refusal state"| vr[(voice registry<br/>ref · owner · consent · sharing)]
+    sc ==>|"gRPC InferSegment(segment_text)<br/>sentence chunk · stream_id · voice_id"| gp[🧠 gpu-inference-pool<br/>TTS → PCM chunks<br/>interactive · LRU voice cache]
+    gp -->|"LOAD voice_weights:{voice_id}"| va[(voice-asset store<br/>refs · embeddings · checkpoints<br/>~28 TB · append-only)]
+    u -->|"POST /batch<br/>HTTPS · JSON"| bjs[batch-job-service<br/>doc segmentation · manifest · retries]
+    bjs -->|"produce: synth.segment"| q{{📨 job queue<br/>durable · synth · clone jobs}}
+    q -.->|"consume: synth.segment"| bp[🧠 batch-pool<br/>preemptible at segment boundaries]
+    bp -.->|"PUT checkpoint:{voice_id}"| va
+    bp -->|"SQL voice lookup"| vr
+    bp -->|"PUT segment outputs"| ob
+    bjs -->|"PUT finalized WAV / MP3 objects"| ob[(🪣 object store<br/>batch deliverables · history)]
+    cdn[/🌍 CDN<br/>vendor/] -->|"GET /batch-objects/*<br/>HTTPS · bytes"| ob
+    u -->|"GET /batch-objects/{id}<br/>HTTPS · bytes"| cdn
+    u -->|"POST /clone<br/>HTTPS · multipart"| ca[consent-and-abuse<br/>phrase verify · refusal · watermark]
+    ca -->|"PUT instant-clone embedding"| va
+    ca -->|"UPSERT voice:{voice_id}<br/>attestation bound"| vr
+    ca -->|"produce: clone.train"| q
+    sc -.->|"produce: usage.session"| m[metering<br/>session chars → aggregates<br/>reconciled]
+    bp -.->|"produce: usage.batch"| m
 ```
 
 ## Components

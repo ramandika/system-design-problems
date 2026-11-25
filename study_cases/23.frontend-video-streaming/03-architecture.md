@@ -2,42 +2,37 @@
 
 ## The player pipeline inside the browser tab
 
-```
-┌──────────────────────────────────── browser tab ────────────────────────────────────┐
-│                                                                                     │
-│  app shell (feed page, route)                                                       │
-│      │  mounts                                                                       │
-│      ▼                                                                               │
-│  ┌─ PLAYER CORE ────────────────────────────────────────────────────────────────┐    │
-│  │                                                                              │    │
-│  │  state machine        (EMPTY→READY→PLAYING→STALLED→…; see 04 §4)             │    │
-│  │      │ commands                ▲ events (stall, append, error, visibility)   │    │
-│  │      ▼                         │                                             │    │
-│  │  ┌──────────────┐   target quality    ┌────────────────────────────────┐     │    │
-│  │  │ ABR CONTROLLER│──────────────────▶│ SEGMENT SCHEDULER / LOADER     │     │    │
-│  │  │ throughput EWMA│                   │ fetch manifest/segments, retry,│     │    │
-│  │  │ buffer BOLA rule│                  │ byte-range, priority queue     │     │    │
-│  │  └──────────────┘                    └───────────────┬────────────────┘     │    │
-│  │        ▲ buffer level                                │ bytes                │    │
-│  │        │                                             ▼                      │    │
-│  │  ┌─────┴────────┐                      ┌────────────────────────────────┐    │    │
-│  │  │ BUFFER METER │◀── buffered ranges ──│ WORKER: demux/remux, parse     │    │    │
-│  │  │ (per buffer) │                      │ init/segment boxes, retime     │    │    │
-│  │  └──────────────┘                      └───────────────┬────────────────┘    │    │
-│  │                                                         │ Transferable        │    │
-│  │  ┌─────────────────────────────── MSE ─────────────────▼──────────────────┐   │    │
-│  │  │ SourceBuffer(video)  SourceBuffer(audio)  SourceBuffer(text)           │   │    │
-│  │  └────────────────────────────────────┬───────────────────────────────────┘   │    │
-│  │                                        ▼                                       │    │
-│  │  <video> element ──▶ decode ──▶ render clock ──▶ pixels/audio                 │    │
-│  │  controls UI / PiP / fullscreen / captions                                    │    │
-│  └──────────────────────────────────────────────────────────────────────────────┘    │
-│                                                                                     │
-│  telemetry emitter (batched, sendBeacon; 04 §6)                                     │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-        │ HTTPS fetch (segments, manifests)          ▲ HTTPS (batched events)
-        ▼                                            │
-  CDN edge (given; Case 09) ◀── origin/manifest service (given; encoding = Case 01)
+Q: How do manifest and segment bytes get from CDN edge to pixels, and how does ABR steer quality?
+
+```mermaid
+flowchart LR
+    subgraph browser[browser tab]
+        sc[player state machine<br/>EMPTY→READY→PLAYING→STALLED]
+        abr[ABR controller<br/>throughput EWMA · BOLA rule]
+        sch[segment scheduler<br/>only component on network]
+        wrk[worker demuxer<br/>boxes → fMP4 fragments]
+        mse[MSE SourceBuffers<br/>video · audio · text]
+        vid[video element<br/>decode · render clock]
+        bm[buffer meter<br/>forward buffer secs]
+        cdm[CDM / Widevine<br/>black box · init before first append]
+        tel[telemetry emitter<br/>ring buffer · sendBeacon]
+    end
+
+    u((🧑 viewer)) -->|"play · seek commands"| sc
+    sch ==>|"GET /videos/{id}/manifest.m3u8 · /segments/*.m4s<br/>HTTPS · fMP4"| cdn[/🌍 CDN<br/>edge vendor/]
+    cdn -->|"GET /manifests/{id}.m3u8 · /segments/*<br/>HTTPS · fMP4"| org[origin + manifest service<br/>encoding = Case 01]
+    sch -->|"segment bytes"| wrk
+    wrk -->|"fMP4 fragments<br/>Transferable buffers"| mse
+    mse --> vid
+    mse -->|"stall · append events"| sc
+    sch -.->|"DRM init request"| cdm
+    bm -->|"read buffered ranges"| vid
+    bm -->|"buffer level secs"| abr
+    sch -->|"throughput samples"| abr
+    bm -->|"buffer level secs · stall margin"| sch
+    abr -->|"target quality"| sch
+    sc -->|"commands"| sch
+    tel -.->|"POST /v1/playback-events<br/>sendBeacon · JSON"| be[telemetry ingest<br/>client event sink · collector out of scope]
 ```
 
 ## Components

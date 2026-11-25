@@ -2,82 +2,38 @@
 
 ## High-level diagram
 
-```
-                webhooks (git hosts)         UI / API consumers
-                        |                            |
-                        v                            v
-                +---------------+            +-------------+
-                |  Event intake |----+------>| API gateway |
-                | (webhook recv,|    |       +------+------+
-                |  cron ticker, |    |              |
-                |  dispatch API)|    |              v
-                +-------+-------+    |       +---------------+
-                        |            |       | Control-plane |
-                        v            |       | DB (sharded   |
-                 +-------------+     |       | SQL, rows =   |
-                 |  Pipeline   |     |       | runs/jobs/    |
-                 |  resolver   |     |       | rollouts)     |
-                 | (manifest ->|     |       +-------+-------+
-                 |  typed DAG) |     |               ^
-                 +------+------+     |    outbox     |
-                        |            |    events     |
-                        v            v               |
-   +----------------------------------------------------------+
-   |                    EVENT BUS (partitioned log)           |
-   |  topics: run.lifecycle, job.lifecycle, log.chunk,        |
-   |          artifact.published, rollout.state               |
-   +-----+-----------------+---------------------+------------+
-         |                 |                     |
-         v                 v                     v
-  +-------------+  +--------------+     +------------------+
-  | DAG EXECUTOR|  | LOG/EVENT    |     | INDEX + SEARCH   |
-  | (interprets |  | SINK         |     | (run history UI, |
-  |  DAG per    |  | (log store,  |     |  audit trail)    |
-  |  run, opens |  |  30d hot)    |     +------------------+
-  |  jobs in    |  +--------------+
-  |  topology   |
-  |  order)     |
-  +------+------+                                  
-         | claims jobs
-         v                                          
-  +--------------------------------------------------+
-  | SCHEDULER: per-runner-pool partitioned queues,   |
-  | fair-share across tenants, admission control     |
-  +------------+-------------------------------------+
-               | long-poll claim (lease + fence token)
-               v
-  +--------------------------------------------------+
-  | RUNNER FLEET (ephemeral): VM pool per SKU        |
-  | + warm container pool; agent pulls job,          |
-  | streams logs, uploads artifacts, exits           |
-  +------------------+-------------------------------+
-                     | artifact put/get
-                     v                secret mint (short TTL)
-             +---------------+      +------------------+
-             | ARTIFACT STORE|<-----| SECRETS BROKER   |
-             | (CAS, signed  |      | (OIDC federation,|
-             |  manifests)   |      |  vault backend)  |
-             +-------+-------+      +------------------+
-                     |
-                     v
-  +--------------------------------------------------+
-  | DEPLOYMENT CONTROLLER                            |
-  | (one state machine per rollout; canary steps)    |
-  +------------------+-------------------------------+
-                     | "evaluate gate G over window"
-                     v
-             +------------------+     queries
-             | HEALTH EVALUATOR |<------------> app TSDB / SLO store
-             | (baseline diff,  |
-             |  promote/hold/   |
-             |  rollback verdict)|
-             +------------------+
+Q: How does a commit become a tested artifact and then a gated production rollout — and what does the event bus fan out?
 
-  Separate concern — updating the platform itself:
-  +--------------------------------------------------+
-  | FLEET ROLLOUT COORDINATOR (waves: dogfood ->     |
-  | staging -> 1 region -> N regions, self-gated)    |
-  +--------------------------------------------------+
+```mermaid
+flowchart LR
+    gh[/git hosts<br/>webhooks/] ==>|"POST /webhooks<br/>HTTPS · JSON · signed"| int[event intake<br/>verify · dedupe]
+    int -.->|"produce: run.requested"| k{{📨 event bus<br/>run · job · log · artifact topics}}
+    k -.->|"consume: run.requested"| res[pipeline resolver<br/>manifest → typed DAG]
+    res -->|"SQL upsert run<br/>status rows + outbox"| db[(control-plane DB<br/>runs · jobs · rollouts · gate rows)]
+    res -->|"git fetch manifest<br/>HTTPS"| gh
+    rl[outbox relay<br/>outbox rows → bus events]
+    rl -->|"SQL poll outbox"| db
+    rl -.->|"produce: run.status"| k
+    k -.->|"consume: run.requested"| dag[dag executor<br/>opens jobs in topo order]
+    dag -->|"gRPC EnqueueJob()<br/>gRPC · proto"| sch[scheduler<br/>per-pool queues · fair share]
+    run[runner fleet<br/>ephemeral VM per SKU] -->|"gRPC Claim()<br/>gRPC long-poll"| sch
+    run -->|"gRPC MintCreds()<br/>gRPC · proto"| sec[secrets broker<br/>vault backend · OIDC → creds<br/>TTL ≤ 15 min]
+    run -->|"CAS put artifact:{sha}"| art[(🪣 artifact store<br/>CAS · signed manifests)]
+    run -->|"restore:{key} · save"| rc[(cache store<br/>declared-input keys · verified restore)]
+    run -.->|"produce: log.chunk"| k
+    run -.->|"produce: job.status"| k
+    run -.->|"produce: artifact.published"| k
+    k -.->|"consume: job.status"| dag
+    k -.->|"consume: artifact.published"| dag
+    k -.->|"consume: artifact.published"| ctl[deployment controller<br/>rollout state machine · canary]
+    ctl -->|"gRPC EvaluateGate()<br/>gRPC · proto"| he[health evaluator<br/>baseline diff → verdict<br/>gate over canary window]
+    ctl -->|"SQL rollouts<br/>routing weight · last-known-good"| db[(control-plane DB<br/>runs · jobs · rollouts · gate rows)]
+    he -->|"query slo:{service, window}"| tsdb[(📈 app TSDB<br/>SLO metrics)]
+    fro[fleet rollout coordinator<br/>platform version → waves · global pause] -->|"gRPC ProposeRollout()<br/>gRPC · proto"| ctl
+    int -->|"gRPC consult global pause"| fro
+    fro -->|"gRPC Lease()<br/>fencing token · epoch"| qu[🗝️ 3-node quorum<br/>leases · fencing tokens · epochs]
+    k -.->|"consume: run.* events"| ui[api gateway<br/>UI · history · audit]
+    ui -->|"SQL run status"| db
 ```
 
 ## Components

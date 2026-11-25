@@ -2,17 +2,19 @@
 
 ## High-level data path
 
+Q: Where does a request stop on the way from client to origin, and who else talks to the POPs?
+
 ```mermaid
 flowchart LR
-    U[clients<br/>worldwide] -->|anycast IP / one address| EP[Edge POP<br/>TLS · L7 filter · L1 cache<br/>DRAM + L2 NVMe]
-    EP -->|hit 95%| U
-    EP -->|miss| SH[Regional shield POP<br/>1 per region<br/>L3 cache + collapse]
-    SH -->|miss| LB[Origin shield LB<br/>TCP/keep-alive pool]
-    LB --> O[(Customer origins<br/>S3/blob/app)]
-    CP[Control plane<br/>config · certs · purge] -->|push &lt;~5 s| EP
-    CP -->|push &lt;~5 s| SH
-    EP -->|async log stream| LP[Log pipeline<br/>analytics + billing]
-    SH -->|async log stream| LP
+    u((🧑 clients<br/>worldwide)) ==>|"1· GET /objects/{key}<br/>HTTPS · anycast"| ep[🌍 Edge POP<br/>TLS · L7 filter · L1 cache<br/>DRAM + L2 NVMe]
+    ep -->|"2· forward key lookup /objects/{key}<br/>internal HTTPS"| sh[Regional shield POP<br/>1–3 per region · active/active<br/>L3 cache + collapse]
+    sh -->|"3· GET /objects/{key}<br/>keep-alive"| lb[Origin shield LB<br/>TCP/keep-alive pool]
+    lb -->|"GET /objects/{key}<br/>origin HTTPS"| o[/Customer origins<br/>S3 · blob · app/]
+    cp[Control plane<br/>config · certs · purge] -.->|"produce: config.update<br/>signed config · purge list"| ep
+    cp -.->|"produce: config.update<br/>signed config · purge list"| sh
+    ms[Map/steering service<br/>anycast health · prefix states<br/>DNS steer for tail] -.->|"produce: steering.update<br/>pop health · steer records"| ep
+    ep -.->|"produce: pop.logs<br/>compressed"| lp[Log pipeline<br/>analytics + billing]
+    sh -.->|"produce: pop.logs<br/>compressed"| lp
 ```
 
 Same path in words, edge-first:

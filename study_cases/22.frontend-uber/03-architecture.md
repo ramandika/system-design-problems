@@ -9,40 +9,36 @@ policy engine** (battery/network-aware throttling and degradation).
 
 ## High-level diagram
 
-```
-              RIDER APP (one process, native or RN/JS + native map engine)
- ┌──────────────────────────────────────────────────────────────────────┐
- │  UI Layer          screens  •  bottom sheets  •  ride banner         │
- │      ▲                                                                │
- │      │ observed state                                                 │
- │  RIDE STORE  ◄────────── reconciler ◄────────── server truth + seq    │
- │   (state machine:  browse→requesting→matched→pickup→trip→done)        │
- │      │                                ▲                               │
- │      ▼ observed ride/car targets       │                              │
- │  RENDER STACK                          │                              │
- │   ├─ Map engine (SDK: raster/vector tiles, gestures, camera)          │
- │   ├─ Vehicle layer (canvas, 200+ markers, 16ms budget)  ◄─ targets    │
- │   └─ Route/ETA layer                                                  │
- │      ▲                                ▲                               │
- │      └── tile fetch ──► CDN           │                               │
- │                                                                        │
- │  REALTIME CLIENT                                                       │
- │   ├─ Socket channel (evented, ordered, seq'd)  ◄── lifecycle events    │
- │   └─ Position channel (lossy, fresh-wins)      ◄── car/vehicle posns   │
- │                                                                        │
- │  NETWORK POLICY  (battery mode, connectivity class, degradation)       │
- │  LOCAL PERSIST  (ride snapshot, tiles, recent places, outbox)          │
- └──────────────────────────────────────────────────────────────────────┘
-          │                                     ▲
-          │ positions (3s moving / 15s idle)    │ socket (WS/gRPC-RT, keepalive)
-          ▼                                     │
-   ┌───────────────┐   ┌─────────────────────┴──────────────────────────┐
-   │ driver apps   │   │ BACKEND (given)                                 │
-   └───────────────┘   │  realtime gateway → position fanout per viewport│
-                       │  trip service (source of truth, event log)      │
-                       │  matching service → offers/matches              │
-                       │  snapshot service → "reconstruct my ride"       │
-                       └───────────────────────────────────────────────────┘
+Q: How do rider events and driver positions flow into one client-side ride store and out to the render stack?
+
+```mermaid
+flowchart LR
+    subgraph app[rider app - one process]
+        ui[UI layer<br/>screens · ride banner]
+        rs[ride store<br/>state machine browse→trip→done<br/>server events + intents only]
+        rc[realtime client<br/>event chan seq'd · posn chan fresh-wins]
+        ren[render stack<br/>map SDK · canvas markers]
+        np[network policy<br/>cadence · degradation]
+        lp[(local persist<br/>snapshot · tiles · outbox)]
+    end
+    subgraph backend[given backend]
+        gw[gateway<br/>per-viewport fanout]
+        ss[snapshot service<br/>reconstruct current ride]
+    end
+
+    u((🧑 rider)) -->|"taps · gestures"| ui
+    ui -->|"RideIntent REQUEST/CANCEL<br/>client UUID"| rs
+    rs -->|"projected ride state → UI"| ui
+    rs ==>|"render target list<br/>id → position targets"| ren
+    ren -->|"GET /tiles/{z}/{x}/{y}<br/>HTTPS · vector"| cdn[/🌍 CDN<br/>map tiles vendor/]
+    gw <-->|"WS ride events seq'd<br/>wss · JSON"| rc
+    gw -->|"position batches<br/>wss push · lossy fresh-wins"| rc
+    rc -->|"subscribe posn · re-neg by phase<br/>wss · JSON"| gw
+    d((🧑 drivers)) -->|"gRPC StreamPosition() · proto<br/>pos updates · 3 s moving / 15 s waiting"| gw
+    rc --> rs
+    rs -->|"GET /ride/current<br/>HTTPS · JSON"| ss
+    rs -->|"PUT snapshot ride:{id}"| lp
+    rc -->|"cadence · degradation policy read"| np
 ```
 
 ## Components

@@ -2,59 +2,51 @@
 
 ## High-level diagram
 
-```
-                     guests (web / iOS / Android)          hosts (web / app)
-                            |          |                      |
-                       CDN  |          |______________________|
-                       ^ ^  |                   |
-                      /  \  v                   v
-        listing      ( edge/API gateway, rate limit, authn )-----+---------+
-        photos ---+ /                     |                    |         |
-                  |/                      v                    v         v
-      +-----------+-------+       +--------------+      +-----------+ +---------+
-      |  IMAGES (blob)     |       |  Search svc  |      | Listing   | | Host    |
-      |  + CDN derivatives |       |  (geo+filter |      | svc       | | calendar|
-      +--------------------+       |   +rank)     |      +-----+-----+ | edit    |
-                                   +------+-------+            |       +-----+---+
-                                          |                    |             |
-                                   +------v--------+           |             |
-                                   | Search index  |<---(reindex stream)-----+|
-                                   | ES/H3 cells,  |     (listing writes,     ||
-                                   | date bitmaps  |      calendar snapshots) ||
-                                   | ~80GB corpus  |                          ||
-                                   +---------------+                          ||
-                                                                              vv
-                              +-------------------+                  +--------------------+
-                              | Messaging svc     |                  |  Calendar svc      |
-                              | (guest<->host,    |                  |  (AVAILABILITY     |
-                              |  scam heuristics) |                  |   TRUTH: day grid  |
-                              +-------------------+                  |   per listing)     |
-                                                                     +---------+----------+
-                                                                               ^
-             +-----------------+     +-------------------+    hold/confirm   |
-             | Review + trust  |     |  Booking svc      |--------------------+
-             | svc (dbl-blind, |     |  (per-listing     |
-             |  graph fraud)   |     |   serialized:     |
-             +-----------------+     |   hold -> confirm)|
-                                     +--------+----------+
-        +---------------------+               |  saga: refund on failure
-        | Trust & risk svc    |<--events------+          |
-        | (KYC tiers, device, |               v          v
-        |  payout gates)      |    +-----------------------+     +----------------+
-        +---------------------+    | Money ledger (escrow, |<--->| PSP adapters   |
-                                    | charges/refunds/      |  ^  | (multi-PSP, FX |
-                                    | payouts)  EXACTLY-ONCE|  |  |  rates, fees)  |
-                                    +-----------------------+  |  +----------------+
-                                            | payout batch     |
-                                            v                  |
-                                    +----------------+         |
-                                    | Payout svc     |---------+
-                                    | (FX -> host    |
-                                    |  accounts)     |
-                                    +----------------+
+Q: Which writes are authoritative (calendar day grid · hold · ledger) and which reads stay advisory (search index · photo CDN)?
 
-   Event bus (booking confirmed/cancelled, listing edits, payment events)
-   feeds: search index updater, calendar reconciliation, ledger, risk, analytics
+```mermaid
+flowchart LR
+    u(("🧑 guest·host"))
+    ss["search svc<br/>geo retrieve → LTR rank"]
+    es[("🔍 search index<br/>H3 cells · date bitmaps<br/>~80GB corpus")]
+    ls[listing svc<br/>CRUD · photos · pricing]
+    img[("🪣 image blob store<br/>content-addressed")]
+    cdn[/"🌍 CDN<br/>listing photos"/]
+    cal[("🐘 calendar DB<br/>AVAILABILITY TRUTH<br/>day grid · 730-day horizon")]
+    bk["booking svc<br/>hold → confirm · saga<br/>sharded by listing_id"]
+    led[("🐘 money ledger<br/>escrow · idempotency keys<br/>exactly-once in effect")]
+    psp[/"external PSP vendors<br/>card auth · payouts"/]
+    po[payout svc<br/>FX at payout → host accounts]
+    c[calendar svc<br/>day grid writes · snapshot publisher]
+    rk["trust & risk svc<br/>KYC · device trust · payout gate"]
+    eb{{"📨 event bus<br/>booking · listing · review · payment"}}
+    rj[reconciliation job<br/>calendar vs bookings · drift alarm]
+    rb["review & trust svc<br/>double-blind · reveal windows"]
+    ms[messaging svc<br/>guest·host threads → fraud signals]
+
+    u -->|"1· GET /search?q<br/>HTTPS · JSON"| ss
+    u ==>|"2· POST /v1/bookings (hold)<br/>HTTPS · JSON"| bk
+    u -->|"GET /img/{hash}<br/>HTTPS · JPEG"| cdn
+    u -->|"PUT /v1/calendar/blocks (host)<br/>HTTPS · JSON"| c
+    ss -->|"query postings<br/>cell set · date range"| es
+    cdn -->|"GET img/{content_hash}"| img
+    bk -->|"read+write · day grid"| cal
+    bk -->|"POST /authorize<br/>HTTPS · JSON"| psp
+    bk -->|"write ledger intent"| led
+    ls -->|"PUT listing photos"| img
+    c -->|"write day grid"| cal
+    c -.->|"produce: calendar.snapshot"| eb
+    bk -.->|"produce: booking.confirmed"| eb
+    ls -.->|"produce: listing.edited"| eb
+    eb -.->|"consume: listing.edited · calendar.snapshot · review.aggregate"| es
+    eb -.->|"consume: booking.confirmed"| rj
+    rj -->|"read+write · day grid audit"| cal
+    eb -.->|"consume: booking.confirmed"| rk
+    rk -->|"risk flag on payout intent"| po
+    rb -.->|"produce: review.aggregate"| eb
+    ms -.->|"message signals"| rk
+    po -->|"SQL escrow entries · payout batch"| led
+    po -->|"POST /payout<br/>HTTPS · JSON"| psp
 ```
 
 ## Components

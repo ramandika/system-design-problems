@@ -6,45 +6,20 @@ hard cumulative quotas, no per-request round trip anywhere near the p99 budget.
 
 ## High level
 
-```
-                            CONFIG PLANE                              CLIENTS
-                            ────────────                                 │
-   ┌──────────────┐  push full    ┌──────────────┐    API request         ▼
-   │ rule/service │  revisioned   │ snapshot blob │  (key+IP+route) ┌─────────────┐
-   │ config store │──snapshots──▶ │ + revision no │                 │ edge / PoP  │
-   │ (tiers, per- │  (static,     │ (every node   │                 │ LB / WAF    │
-   │ key over-    │   CDN-able)   │  holds full   │                 └──────┬──────┘
-   │ rides)       │               └──────────────┘                        │
-   └──────────────┘                    ▲                                  ▼
-        │ rule writes          revision broadcast                     ┌──────────────────┐
-        ▼                      (each node pins last-known-good)       │ GATEWAY node (×~100)│
-  admin API / dashboard                                              │ ┌──────────────┐ │
-                                                                     │ │ local limiter │ │
-        DECISION DATA PLANE                                          │ │ lease buckets │ │
-        ────────────────────                                         │ │ (token buckets│ │
-   API request ──▶ AUTH ──▶ rule resolution (from snapshot) ──▶      │ │  + rule cache)│ │
-   ──▶ L1: LOCAL token bucket (burst-shaping rules; per-key lease    │ └──────┬───────┘ │
-        refreshed in background)  ── admit/reject ──▶ headers ──▶    └────────┼─────────┘
-                                                  │       │                   │
-                                     lease refresh│       │ 429 + reason +    │ escalate only
-                                     (async, batch│       │ Retry-After       │ (unknown IP,
-                                     deltas, ~0.5s)       ▼      hard quota, ⌄
-                                     ▼                            anomaly)   │
-                       ┌─────────────────────────────┐                      ▼
-                       │ quota authority (Redis-class│        ┌──────────────────────────┐
-                       │ cluster, sharded by key hash│        │ counter store (Redis-    │
-                       │ - per-shard lease manager   │◀──────▶│ class, ~10 shards)       │
-                       │  for the hot-fat-key case)  │        │ - Lua-class atomic       │
-                       └──────────────┬──────────────┘        │   decide-and-update      │
-                                      │                       │ - chunked counters for   │
-                                      │                       │   fat keys (deep dive 4) │
-                                      ▼                       └────────────┬─────────────┘
-                       monthly/hourly hard quotas,                       │
-                       per-IP abuse verdicts                             │ decisions (sampled
-                                      │                                  │ on backpressure)
-                                      ▼                                  ▼
-                            analytics / usage dashboards        Kafka-class decision log
-                            billing rollups (async, replayable) ──▶ rollup jobs
+Q: How is a request admitted or 429'd with no per-request store round trip on the hot path?
+
+```mermaid
+flowchart LR
+    cl((🧑 clients<br/>key · IP · route)) ==>|"1· POST /v1/charges<br/>HTTPS · JSON"| gw[gateway node ×100<br/>TLS · auth · rules snapshot<br/>local lease buckets · 429 + Retry-After]
+    gw -->|"GET rules revision N<br/>snapshot blob"| cf[(rule config store<br/>tier defaults · per-key overrides<br/>revisioned snapshots)]
+    op((🧑 operator)) -->|"PUT rules · overrides"| cf
+    gw -.->|"gRPC LeaseRefresh()<br/>delta batch · ~500 ms"| qa[(⚡ quota authority<br/>sharded key hash<br/>per-shard lease manager)]
+    gw -->|"atomic decide+update<br/>hard quotas · abuse IPs"| cs[(⚡ counter store<br/>~10 shards · Lua decide+update<br/>chunked fat keys)]
+    gw -.->|"produce: decision<br/>admit · 429"| k{{📨 decision log<br/>sampled under backpressure}}
+    k -.->|"consume: decision"| an[usage dashboards]
+    k -.->|"consume: decision"| br[billing rollups]
+    k -.->|"consume: decision"| ae[abuse engine<br/>429 streaks → greylist rule drafts]
+    ae -.->|"PUT rules · greylisted IPs"| cf
 ```
 
 ## Components

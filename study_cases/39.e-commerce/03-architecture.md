@@ -15,74 +15,29 @@ The system is split by consistency contract, not by domain:
   writes a read model inline; read models are projections and are rebuildable by
   replay.
 
-```
-   +-------------+   +------------------+   +-----------------------+
-   |   Clients   |   |  Mobile / Web    |   |   3rd-party (APIs)    |
-   +------+------+   +--------+---------+   +-----------+-----------+
-          |                   |                         |
-          +---------+---------+-----------+-------------+
-                    |  TLS termination, bot/RB checks,
-                    v  rate limits, surge admission (deep dive 6)
-          +---------------------+
-          |      Edge / CDN     |  images, media, static shells, page fragments
-          |   (09.cdn pattern)  |  [90%+ of media bytes; peak read armor]
-          +----------+----------+
-                     | cache misses + dynamic APIs
-                     v
-          +---------------------+
-          |    API gateway      |  routing, authn, idempotency-key plumbing,
-          +----------+----------+  per-service quota
-                     |
-        +------------+-----------------+----------------------------+
-        | READ PLANE (eventual, cached)                                |
-        |                                                              |
-        |  +----------------+   +---------------+   +---------------+  |
-        |  | Catalog/Browse |   |  Search svc   |   |  Personalize  |  |
-        |  | svc (fragments |   | (facets, rank)|   |  svc          |  |
-        |  | in KV cache)   |   +-------+-------+   +-------+-------+  |
-        |  +--------+-------+           |                   |          |
-        |           |          +--------v--------+          |          |
-        |           |          | Search index     |  <-- same event     |
-        |           |          | (sharded, 1-2TB) |     projections     |
-        |           v          +--------+---------+                    |
-        |  +---------------------------+   +--------------------+      |
-        |  | Distributed cache (10.distributed-cache shape):           |  |
-        |  |  PDP fragments | price | availability badge | recommendations  |
-        |  +---------------------------+   +--------------------+      |
-        +---------------- | --------------------------------------------+
-                          | (browse reads never touch this plane)
-                          v
-        +----------------------------------------------------------------+
-        | TRANSACTIONAL PLANE (strongly consistent)                       |
-        |                                                                 |
-        |  +----------------+   +------------------+   +---------------+ |
-        |  | Cart svc       |   | Checkout         |   | Order svc     | |
-        |  | (KV-backed,    |   | orchestrator     |   | (state        | |
-        |  |  guest+account)|   | (idempotency     |   |  machine)     | |
-        |  +----------------+   |  keys, saga)     |   +-------+-------+ |
-        |                        +---+-----+--------+           |         |
-        |                            |     |                    |         |
-        |             +--------------+     +--------+           |         |
-        |             v                         v           v         |
-        |  +---------------------+   +-----------------+  +-----------+  |
-        |  | Inventory svc       |   | Promotions svc  |  | Payment   |  |
-        |  | (ATP + reservations,|   | (atomic coupon  |  | (PSP      |  |
-        |  |  checkout is sole   |   |  redemption)    |  |  adapter) |  |
-        |  |  reservation writer)|   +-----------------+  +-----------+  |
-        |  +---------------------+                                        |
-        +---------------------- | ---------------------------------------+
-                                | one-way: domain events, append-only
-                                v
-        +----------------------------------------------------------------+
-        | EVENT SPINE (Kafka-tier, ~15B events/day, partitioned by        |
-        | order_id / sku_id / customer_id)                                |
-        +---+-------------+-------------+----------------+---------------+
-            |             |             |                |
-            v             v             v                v
-      Search indexer  Availability   Analytics/ML     Fulfillment
-      (read model)    projection     features         workflow svc
-                      (read model)                    (starts from
-                                                       ORDER_PLACED event)
+Q: How do the cached read plane and the strongly consistent checkout plane meet one append-only event spine?
+
+```mermaid
+flowchart LR
+    cli((🧑 clients<br/>web · mobile · API)) ==>|"1· GET /pdp<br/>HTTPS · JSON"| cdn[/🌍 CDN<br/>media · page fragments/]
+    cdn -->|"2· GET /pdp<br/>HTTPS · JSON"| gw[API gateway<br/>authn · idempotency keys · quotas]
+    gw -->|"GetPDP()<br/>gRPC · proto"| cat[catalog svc<br/>fragments · facets<br/>fronts authoritative SKU store]
+    cat -->|"⚡ MGET pdp:{sku}"| cach[(⚡ KV cache<br/>PDP fragments · price · recs<br/>badges · guest + account carts)]
+    gw -->|"MergeCart()<br/>gRPC · proto"| csvc[cart svc<br/>guest → account merge<br/>quantity adds · tombstone guest]
+    csvc -->|"⚡ read + write carts<br/>tombstone guest"| cach
+    gw -->|"Search()<br/>gRPC · proto"| se[search svc<br/>facets · rank]
+    se -->|"query postings"| idx[(🔍 search index<br/>sharded · ~1–2 TB)]
+    gw -->|"3· POST /checkout<br/>HTTPS · JSON"| co["checkout orchestrator<br/>saga: reserve → authorize → promo → commit"]
+    co -->|"Reserve()<br/>gRPC · proto"| inv[inventory svc<br/>all-or-nothing ATP + reservations<br/>sole reservation writer]
+    co -->|"Redeem()<br/>gRPC · proto"| pmo[promotions svc<br/>atomic coupon redemption]
+    co -->|"Authorize()<br/>HTTPS · JSON"| psp[/"payment PSP<br/>Authorize() via checkout adapter"/]
+    co -->|"CreateOrder()<br/>gRPC · proto"| ord[order svc<br/>state machine]
+    co -.->|"4· produce: ORDER_PLACED"| sp{{📨 event spine<br/>~15B events/day<br/>keyed by order · sku · customer}}
+    cat -.->|"produce: sku.updated"| sp
+    ord -.->|"produce: order.status_changed"| sp
+    sp -.->|"consume: sku.updated · inventory.committed · ORDER_PLACED"| proj[projection consumers<br/>search indexer · availability<br/>fulfillment workflow]
+    proj -->|"PUT pdp:{sku}"| cach
+    proj -->|"PUT postings"| idx
 ```
 
 ## Data flows

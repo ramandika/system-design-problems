@@ -2,32 +2,28 @@
 
 ## Diagram
 
-```
- CLIENTS ── HTTPS ──► FRONT-END TIER (fleet of API gateways, ~10K nodes)
-                        │  authn (request signing), parse, tenant limits,
-                        │  routing by (bucket, key) → storage-set map
-     ┌──────────────────┼─────────────────────────────┐
-     ▼                  ▼                             ▼
- METADATA / CONTROL PLANE                         DATA PLANE
-   index sharded by bucket                          storage nodes w/ HDDs,
-   (object key → stripe id,                        log-structured shard stores
-    part sets, versions, ACLs)                        ▲
-   small, strongly consistent,                     stripes of RS(k=8,m=4)
-   key-ordered per bucket                          shards spread across
-     │                                             racks / hosts / DCs
-     │  (index tells front-end WHERE)                ▲
-     └────────────────► front-end PUTs/GETs ─────────┘
-                        bytes directly to data plane
-                        (metadata record committed
-                        before PUT ack ⇒ durable)
+Q: Where does a client PUT/GET flow through the control and data planes, and what runs in the background?
 
- BACKGROUND INFRASTRUCTURE (no client calls)
-   scrubber      — read+verify stripes continuously, checksum every shard;
-                   on mismatch/missing shard → enqueue repair
-   repair worker — recompute lost shard from k survivors, write replacement
-   rebalancer    — drain/decommission, capacity skew correction
-   multipart txn — part registry, CompleteMultipartUpload commit
-   billing/meter — usage events from front-end (async)
+```mermaid
+flowchart LR
+    c((🧑 clients)) ==>|"PUT /object<br/>HTTPS · signed chunks"| fe[front-end fleet<br/>authn · tenant limits<br/>route · pick stripe layout]
+    c -->|"GET /object<br/>HTTPS · byte stream"| fe
+    fe -->|"GET index record · LIST prefix scans"| mt[(metadata index<br/>key → stripe · parts · versions<br/>sharded by bucket)]
+    fe -->|"2· write index record:bucket-key"| mt
+    fe -->|"1· PUT shards<br/>RS(8,4) stripes"| dp[(data plane nodes<br/>log-structured shard stores<br/>HDD · flash hot tier)]
+    fe -->|"GET ≥k of 12 shards"| dp
+    fe -.->|"produce: usage.events"| mb{{📨 metering pipe<br/>usage records · at-least-once}}
+    fe -->|"gRPC CompleteMultipartUpload()"| mp[multipart coordinator<br/>part registry · commit txn]
+    mp -->|"write part index + commit"| mt
+
+    subgraph bgi["background infra — no client calls"]
+      sc[scrubber<br/>read + verify stripes<br/>~20 pct of disk budget] -->|"GET shards + stored checksums"| dp
+      sc -.->|"produce: repair.jobs"| rq{{"📨 repair queue<br/>(stripe, lost shard id) jobs · at-least-once"}}
+      rq -.->|"consume: repair.jobs"| rw[repair-worker<br/>rebuild shard from k survivors]
+      rw -->|"read k survivor shards"| dp
+      rw -->|"PUT replacement shard"| dp
+      rb[rebalancer<br/>drain · fix capacity skew] -->|"read+write moved shards"| dp
+    end
 ```
 
 ## Components

@@ -2,42 +2,28 @@
 
 ## High-level diagram
 
-```
- Developer (App Store Connect web/API)
-      |  resumable multi-GB upload (F1)
-      v
- [Ingest & Verify Gateway] -- signature-of-origin check, virus/static pre-screen
-      |                                   |
-      v                                   v
- [Asset Pipeline]                     [Catalog Metadata DB]
-  - thinning: universal -> device        (per-storefront listings,
-    + OS variants                          pricing, availability)
-  - delta generation vs kept bases     (writes only via review gate)
-  - (re)signing + provisioning          |
-    profiles                            v
-      |                          [Search Indexer] -> [Search Cluster]
-      v                                  ^                |
- [Approved Binary Blob Store] ----------/  (index rebuilt from  |
-  (immutable versioned objects,    approved catalog only)      |
-   erasure coded, ~4 PB)                                       |
-      |                                                       |
-      v                                                       v
- [Delta/Manifest Service] -----> [Distribution Service] <--> [CDN Edges]
-  (per-device manifest: which     (redirects, signed URLs,     (75 PB/day egress,
-   variant, which delta chain,     range requests, throttling)   ~9 PB/day origin)
-   full fallback URLs)                 ^
-      |                                |
-      v                                |
- [Storefront API] <--------------- ~1B active clients/day (02 A1)
-  - browse, search, detail, charts
-  - update check-ins (manifest compare)
-      |
-      v
- [IAP Service] -- idempotent purchase ledger (single-writer tx store)
-      |   \--> [Receipt Service] -> signs receipts -> device (offline validation)
-      |            \-> [Payment Processors] (per-region PSPs)
-      v
- [Transaction Event Stream] --> [Charts/Analytics Aggregators] (hourly rollups)
+Q: How does a developer upload become a released app, and how do ~1B clients check in, download, and pay?
+
+```mermaid
+flowchart LR
+    dev((🧑 developer<br/>App Store Connect)) -->|"1· POST /v1/submissions<br/>HTTPS · resumable upload"| gw[ingest-verify-gw<br/>developer signature check<br/>resumable multi-part intake]
+    gw -->|"2· POST /v1/verified-binaries<br/>HTTPS · pkg"| pipe[asset-pipeline<br/>universal → device variants<br/>deltas + re-sign]
+    pipe -->|"3· PUT variants + deltas"| bl[(🪣 approved blob store<br/>immutable · versioned<br/>erasure coded · ~4 PB)]
+    pipe -.->|"produce: app.submitted"| rv[review-pipeline<br/>pre-screen → reviewer console<br/>verdict is the only release writer]
+    rv -->|"SQL release rows<br/>listing · availability"| ct[(catalog metadata DB<br/>listings · pricing · availability<br/>writes only via review gate)]
+    ct -.->|"produce: catalog.changed"| eb{{📨 catalog change events}}
+    eb -.->|"consume: catalog.changed"| sf[storefront/check-in tier<br/>check-in → delivery plan · event-fed cache<br/>delta chain + full fallback]
+    eb -.->|"consume: catalog.changed"| si[search indexer<br/>global index + per-storefront delta layer]
+    eb -.->|"consume: catalog.changed"| dist[distribution-service<br/>signed URLs · throttling · CDN pre-warm API]
+    u -->|"4· POST /v1/checkin<br/>HTTPS · manifest request"| sf
+    u ==>|"5· GET /v1/objects/{key}<br/>HTTPS · range requests"| cdn[/🌍 CDN edges<br/>vendor/]
+    cdn -->|"GET /v1/objects/{key}<br/>HTTPS · stream"| dist
+    dist -->|"GET object:(variant, version)"| bl
+    u -->|"6· POST /v1/purchases<br/>HTTPS · JSON · idempotency key"| iap[IAP + receipt service<br/>signed offline receipts]
+    iap -->|"SQL ledger tx<br/>idempotency key"| lg[(ledger<br/>single-writer sharded<br/>append-only)]
+    iap -->|"POST /v1/charges<br/>HTTPS · JSON · tokenized card"| psp[/payment processors<br/>per-region PSP/]
+    iap -.->|"produce: purchase.completed"| k{{📨 transaction event stream}}
+    k -.->|"consume: purchase.completed"| agg[charts-analytics<br/>hourly rollups per app · storefront]
 ```
 
 The review pipeline is the spine that connects developer writes to public reads:

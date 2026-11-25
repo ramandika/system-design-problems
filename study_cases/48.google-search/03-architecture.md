@@ -14,52 +14,27 @@ short TTL) and the doc-ID space assigned at indexing time.
 
 ## 2. Diagram
 
-```
-  ┌──────────────────────────── BUILD PLANE ────────────────────────────┐
-  │  handoff stream  (content records, links, freshness signals)        │
-  │  from [41](../41.web-crawler/03-architecture.md) §3.6               │
-  │        │                                                            │
-  │        ▼                                                            │
-  │  ┌──────────────┐   ┌──────────────┐    ┌──────────────────────┐    │
-  │  │ INDEXER      │──▶│ FRESH TIER   │───▶│ BASE INDEX           │    │
-  │  │ docid assign │   │ (small immut.│  seg-│ (imm. segments,      │    │
-  │  │ tokenize, pg │   │  segments,   │ merge│  ~2,000 shards,      │    │
-  │  │ postings, cmp│   │  minutes-old)│      │  ~50 M docs each)    │    │
-  │  └──────────────┘   └──────┬───────┘    └──────────┬───────────┘    │
-  └────────────────────────────┼───────────────────────┼────────────────┘
-                               │ queried in parallel   │ queried in parallel
-                               ▼                       ▼
-  ┌──────────────────────────── SERVING PLANE ──────────────────────────┐
-  │                    ┌────────────────────┐                           │
-  │ user query ───────▶│ FRONT-END (FE svc) │◀─── query cache (results, │
-  │                    │ parse, spell,      │      short TTL, ~25% hit) │
-  │                    │ plan → fanout      │                           │
-  │                    └──┬───────┬─────────┘                           │
-  │        ┌──────────────┘       │   ┌──────────────┐                 │
-  │        ▼ broadcast            │   ▼ broadcast   ▼                 │
-  │  ┌───────────────┐    ┌───────────────┐   ┌────────────────────┐    │
-  │  │ BASE SHARD    │    │ BASE SHARD ...│   │ FRESH-TIER REPLICA │    │
-  │  │ leaf: top-K   │    │ (2,000 total) │   │ + vertical leaves  │    │
-  │  │ WAND retrieval│    │               │   │ (news/imgs/video)  │    │
-  │  └──────┬────────┘    └──────┬────────┘   └─────────┬──────────┘    │
-  │         │   per-shard top-k  │                      │               │
-  │         └────────────┬───────┴──────────────────────┘               │
-  │                      ▼                                              │
-  │  ┌──────────────────────────┐     ┌──────────────────────┐          │
-  │  │ MERGE + COARSE RANKER    │────▶│ HEAVY RANKER         │          │
-  │  │ top ~5k → order          │ top~200 (neural model,          │          │
-  │  └──────────────────────────┘     │  feature fetch)      │          │
-  │                                   └──────────┬───────────┘          │
-  │                                              ▼                      │
-  │  ┌──────────────────────────┐     ┌──────────────────────┐          │
-  │  │ PAGE STORE / SNIPPETS    │◀────│ SERP COMPOSER        │          │
-  │  │ (extracted text 800 TB,  │     │ (snippets highlighted│          │
-  │  │  per-doc, query-aware    │     │  + verticals + cache │          │
-  │  │  cache [§8 02])          │     │  write-back)         │          │
-  │  └──────────────────────────┘     └──────────┬───────────┘          │
-  └──────────────────────────────────────────────┼──────────────────────┘
-                                                 ▼
-                                              response
+Q: How does one query become ten blue links through fanout, ranking stages, and caches — and how does the build plane feed the index?
+
+```mermaid
+flowchart LR
+    u((🧑 user)) ==>|"1· GET /search<br/>HTTPS · JSON"| fe[front-end<br/>parse · spell · plan<br/>deadline clock per stage]
+    fe -->|"2· GET results:{q}<br/>normalized query · JSON"| qc[(query cache<br/>keyed by normalized query<br/>short TTL)]
+    fe -->|"3· gRPC Search(q) · proto"| bi[(🔍 base index<br/>~2,000 shards · postings<br/>impact-ordered)]
+    fe -->|"3· gRPC Search(q) · proto"| ft[(🔍 fresh tier<br/>minutes-old segments)]
+    fe -->|"3· gRPC Vertical(q) · proto"| vt[vertical rankers<br/>news · images · video · places · shopping<br/>omit on timeout]
+    bi -->|"per-shard top-K<br/>gRPC · proto"| mg[merge + coarse ranker<br/>~2,000 top-K → ~5K → top 200]
+    ft -->|"candidates<br/>gRPC · proto"| mg
+    mg -->|"gRPC Rank(top 200)<br/>gRPC · proto"| hv[heavy ranker<br/>top 200 → top 10<br/>neural cross-encoder re-score]
+    hv -->|"GET features:{docid}"| ps[(🪣 page store<br/>800 TB extracted text<br/>query-aware snippet cache)]
+    hv -->|"top 10"| sc[SERP composer<br/>snippets highlighted · verticals]
+    vt -->|"vertical results"| sc
+    sc -->|"read text · snippets"| ps
+    sc -->|"write results:{q}"| qc
+    hs{{📨 crawler handoff stream<br/>content · links · freshness<br/>from 41.web-crawler}} -.->|"consume: content records"| ix[indexer<br/>tokenize · docid assign<br/>→ postings]
+    ix -->|"write segments"| ft
+    mr[bg merger<br/>fresh segments → merged base segment] -->|"write merged segments"| bi
+    mr -->|"read segments"| ft
 ```
 
 ## 3. Components

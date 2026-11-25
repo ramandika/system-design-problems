@@ -2,37 +2,26 @@
 
 ## Diagram
 
-```
-   submit prompt ──► API Gateway (auth, quota, prompt moderation)
-                          │
-                          ├─ rejects here (prompt verdict, quota) ──► client
-                          │
-                          ▼
-                    Job service ──► Job store (durable: prompt, params, seed,
-                          │         model ver, state, owner, cost units)
-                          │
-                          ▼
-                    Priority queues ─────────── free tier ─┐
-                          ▲        │                        │  (spot GPUs)
-                          │        └─ paid tier (priority)─┤
-                          │                                │
-                          ▼                                ▼
-                    GPU scheduler (batch packing, lease jobs, idempotent claim)
-                          │
-                          ▼
-                    GPU worker pools ──► diffusion model (pinned version)
-                          │              + post-generation NSFW classifier
-                          │                    │ reject ──► state=rejected
-                          │                    │ review  ──► human review queue
-                          ▼
-                    Result store (blob: full-res + 3 derived sizes)
-                          ▼
-                    Job service marks done ──► webhook / poll (client dedup
-                                               by event ID, retry on miss)
+Q: How does a prompt become a delivered image — and where do moderation and the GPU path gate?
 
-
-   fetch image ──► CDN ──(miss)──► Blob serving tier ──► Origin blob store
-                          └── signed URLs; results immutable
+```mermaid
+flowchart LR
+    u((🧑 client)) ==>|"POST /v1/images<br/>HTTPS · JSON"| gw[api-gateway<br/>auth · quota · cheap prompt filter]
+    gw -->|"gRPC createJob()"| js[job-service<br/>durable record → enqueue by tier]
+    js -->|"1· SQL upsert job row"| jdb[(job store<br/>prompt · params · seed · state)]
+    js -->|"2· produce: image.job<br/>by tier"| q{{📨 priority queues<br/>free spot · paid first}}
+    q -.->|"consume: image.job"| sch[gpu-scheduler<br/>batch pack · lease jobs<br/>idempotent claim]
+    mr -.->|"pinned model version"| wk[gpu-worker<br/>diffusion → NSFW screen<br/>exact-request cache]
+    wk -->|"gRPC LeaseJobs()"| sch
+    wk -->|"GET hash(prompt‖params‖seed‖ver)"| c[(exact-request cache<br/>hash → result mapping · TTL)]
+    wk -->|"PUT blobs"| rb[(🪣 result blob store<br/>full-res + derived sizes<br/>immutable · TTL)]
+    wk -.->|"produce: image.review · borderline band"| rv[human-review<br/>borderline holds]
+    js -.->|"produce: image.done · image.failed"| bl[/billing hooks<br/>charge on completion<br/>refund on permanent fail/]
+    u -->|"GET job status<br/>HTTPS · JSON"| js
+    js -.->|"produce: image.done<br/>webhook · at-least-once"| u
+    u -->|"GET object via signed URL<br/>HTTPS · JPEG"| cdn[/🌍 CDN/]
+    cdn -.->|"miss: expired object"| rb
+    rb -.->|"push: derived objects<br/>HTTPS · JPEG"| cdn[/🌍 CDN/]
 ```
 
 ## Components

@@ -7,43 +7,56 @@ Five planes: **serve** (the per-request funnel), **ingest** (upload→transcode�
 shared **metadata/feature substrate**. The defining property: the serve plane computes
 the feed per request from live state — nothing stores "your feed".
 
-```
-                       ┌─────────────────────────── CLIENT ───────────────────────────┐
-                       │  swipe UI + player (Case 25)   batched telemetry sender      │
-                       └───────┬──────────────────────────────────┬───────────────────┘
-                               │ /feed?page                     │ events (batched POST, ~50/POST)
-                               ▼                                ▼
- ┌──────────────────── SERVE PLANE ─────────────────┐   ┌──────── OBSERVE PLANE ────────────┐
- │  Feed gateway                                    │   │  edge collectors (ack fast,       │
- │    │ 1. RECALL  (parallel retrievers, ~10K)      │   │  durable accept)                  │
- │    │     interest-idx │ ANN(user emb) │ follow  │   │        │                          │
- │    │     │ trending │ sound/hashtag │ rewatch    │   │        ▼                          │
- │    │ 2. FILTER    seen / dedup / rules (~6K)     │   │  event log bus (Kafka-class,      │
- │    │ 3. COARSE RANK  tiny model (~2B scores/s    │   │  partition by user_id)  [Case 13] │
- │    │              fleet-wide, mean)              │   │        │                          │
- │    │ 4. FINE RANK   heavy model (~600)           │   │    ┌───┴────────┬───────────┐    │
- │    │ 5. SLATE        diversity, quotas, caps,    │   │    ▼            ▼           │    │
- │    │                 exploration pool → serve 10 │   │ online feature   offline    │    │
- │  Budget: <~500 ms p99; degrade to step-3         │   │ updater (≤5–30 s) lake       │    │
- │  ordering, never downgrade past it               │   │ (writes to      (training,    │    │
- └──────────────┬───────────────────────────────────┘   │ feature store)  analytics)   │    │
-                │ video IDs + renditions                │    └──┬───────┬───────┬──────┘    │
-                ▼                                       │       │       │       │ (counters,│
- ┌──────── STORE / EDGE ─────────────────────────┐      │       │       │       │  approx)  │
- │   CDN edge ── segments/renditions ── origin   │◄─────┼───────┴───────┴───────┘           │
- │   [Case 09]                        [Case 07]  │      └───────────────────────────────────┘
- └───────▲────────────────────────────────────────┘
-         │ read-through, ≥90% edge hits                    ┌────────── METADATA SUBSTRATE ──────────┐
-         │                                                 │ video meta (title, ladder, perms)      │
- ┌───────┴───────── INGEST PLANE ─────────────────┐        │ engagement counters (approx, sharded)  │
- │ uploader → chunked/resumable upload service    │        │ item features (cached near rankers)    │
- │     → pre-publish moderation gate (cheap,      │        │ embeddings index (video/user, ANN)     │
- │        blocks *serving* only)                  │        └────────▲──────────────┬────────────────┘
- │     → PUBLISH video meta + 1st rendition       │─────────────────┘              │
- │     → transcode farm (queue, per-title ladder, │        (register ladder,       │
- │        ~26K cores est.) → rest of ladder       │         ANN upsert, feature    │
- │     → async full moderation + takedown recall  │         bootstrap)             │
- └────────────────────────────────────────────────┘◄───────────────────────────────┘
+Q: How does one swipe run the serve funnel, and how does the event loop close back into features before the next fetch?
+
+```mermaid
+flowchart LR
+    u(("🧑 user<br/>swipe UI + player<br/>batched telemetry sender"))
+    gw["feed gateway<br/>recall → filter → coarse rank → fine rank → slate<br/>budget ~500 ms p99 · degrade to step-3"]
+    emb[("🧲 ANN index<br/>video · user embeddings")]
+    vd[("video meta<br/>title · ladder · perms")]
+    cn[("engagement counters<br/>approximate · sharded")]
+    ft[("feature store<br/>online · fresh ~5–30 s")]
+    col[edge collectors<br/>durable accept · ack fast]
+    k{{"📨 event log bus<br/>partition by user_id"}}
+    ups[online feature updater<br/>events → fresh features]
+    agg[streaming aggregator<br/>user.events → counter deltas]
+    lake[("offline lake<br/>training · analytics")]
+    cdn[/"🌍 CDN edge<br/>≥90% segment hits"/]
+    ob[("🪣 origin blob store<br/>originals · renditions")]
+    upl["upload svc<br/>chunked · resumable<br/>→ moderation gate → enqueue"]
+    mod["async moderation review<br/>flags video → takedown (N7)"]
+    xc["transcode farm<br/>per-title ladder"]
+    pb["publish hook<br/>meta register · ANN upsert<br/>feature bootstrap"]
+
+    u ==>|"1· GET /feed?page<br/>HTTPS · JSON"| gw
+    gw -->|"ANN topK user emb"| emb
+    gw -->|"GET title · ladder · perms"| vd
+    gw -->|"GET fresh features"| ft
+    gw -->|"GET counters"| cn
+    u -->|"2· GET segments<br/>HTTPS · bytes"| cdn
+    cdn -->|"GET segment:{id}"| ob
+    u -->|"3· POST /v1/events<br/>HTTPS · JSON"| col
+    col -.->|"produce: user.events"| k
+    k -.->|"consume: user.events"| ups
+    ups -->|"UPSERT features"| ft
+    k -.->|"consume: user.events"| agg
+    agg -.->|"apply counter deltas"| cn
+    k -.->|"consume: user.events"| lake
+    u -->|"4· POST /upload/sessions<br/>HTTPS · chunk bytes"| upl
+    upl -->|"PUT original"| ob
+    upl -.->|"produce: transcode.job"| tq{{"📨 transcode queue<br/>priority by predicted audience"}}
+    tq -.->|"consume: transcode.job"| xc
+    xc -->|"PUT ladder renditions"| ob
+    upl -.->|"produce: video.publish"| k
+    k -.->|"consume: video.publish"| pb
+    xc -.->|"produce: rendition.ready"| k
+    k -.->|"consume: rendition.ready"| pb
+    pb -->|"register meta · ladder · perms"| vd
+    pb -->|"UPSERT video embedding"| emb
+    pb -->|"bootstrap item features"| ft
+    mod -.->|"remove video meta"| vd
+    mod -.->|"evict segment cache"| cdn
 ```
 
 ## Components
